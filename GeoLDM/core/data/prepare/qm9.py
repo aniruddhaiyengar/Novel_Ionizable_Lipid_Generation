@@ -1,15 +1,19 @@
-import numpy as np
-import torch
-
-import logging
 import os
+import logging
 import urllib
+import zipfile
+import tarfile
+import numpy as np
+from tqdm import tqdm
 
-from os.path import join as join
-import urllib.request
+from GeoLDM.core.data.prepare.process import process_xyz_files, process_xyz_gdb9
+from GeoLDM.core.data.prepare.utils import download_data, is_int, cleanup_file
 
-from qm9.data.prepare.process import process_xyz_files, process_xyz_gdb9
-from qm9.data.prepare.utils import download_data, is_int, cleanup_file
+
+_qm9_stats = {
+    "U0": {"mean": -13.046721, "std": 0.868950},
+    "U": {"mean": -13.046721, "std": 0.868950},
+}
 
 
 def download_dataset_qm9(datadir, dataname, splits=None, calculate_thermo=True, exclude=True, cleanup=True):

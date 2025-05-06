@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
-from qm9.data.args import init_argparse
-from qm9.data.collate import PreprocessQM9
-from qm9.data.utils import initialize_datasets
+from GeoLDM.core.data.args import init_argparse
+from GeoLDM.core.data.collate import PreprocessQM9
+from GeoLDM.core.data.utils import initialize_datasets
 import os
 
 
@@ -36,9 +36,26 @@ def retrieve_dataloaders(cfg):
                                          collate_fn=preprocess.collate_fn)
                              for split, dataset in datasets.items()}
     elif 'geom' in cfg.dataset:
-        import build_geom_dataset
-        from configs.datasets_config import get_dataset_info
-        data_file = './data/geom/geom_drugs_30.npy'
+        # Assume build_geom_dataset is in the *parent* directory or PYTHONPATH
+        try:
+            import build_geom_dataset 
+        except ImportError:
+            # If running from GeoLDM/core, need to go up two levels
+            import sys
+            parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            if parent_dir not in sys.path:
+                 sys.path.insert(0, parent_dir)
+            import build_geom_dataset
+            
+        from .configs.datasets_config import get_dataset_info
+        data_file = 'GeoLDM/data/geom/geom_drugs_30.npy' 
+        if not os.path.exists(data_file):
+             script_dir_data_file = os.path.join(os.path.dirname(__file__), '../data/geom/geom_drugs_30.npy')
+             if os.path.exists(script_dir_data_file):
+                 data_file = script_dir_data_file
+             else:
+                  raise FileNotFoundError(f"Could not find geom data file at {data_file} or {script_dir_data_file}")
+                  
         dataset_info = get_dataset_info(cfg.dataset, cfg.remove_h)
 
         # Retrieve QM9 dataloaders
@@ -79,3 +96,22 @@ def filter_atoms(datasets, n_nodes):
         datasets[key].num_pts = dataset.data['one_hot'].size(0)
         datasets[key].perm = None
     return datasets
+
+
+if __name__ == '__main__':
+    # This is a simple example of how to use the dataloaders
+    class Config:
+        def __init__(self):
+            self.batch_size = 128
+            self.num_workers = 0
+            self.filter_n_atoms = None
+            self.datadir = "GeoLDM/core/data/qm9/temp/qm9"
+            self.dataset = "qm9"
+            self.remove_h = False
+            self.include_charges = True
+
+    cfg = Config()
+    dataloaders, charge_scale = retrieve_dataloaders(cfg)
+    for i, data in enumerate(dataloaders['train']):
+        print(data)
+        break

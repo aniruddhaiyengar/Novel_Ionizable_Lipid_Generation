@@ -8,31 +8,30 @@ This script performs UNCONDITIONAL training.
 Based on finetune_lipids.py
 '''
 
-# Rdkit import should be first, do not move it
 from rdkit import Chem
 
 
 # Local imports
-import lipid_dataset # Import our dataset module
-from configs.datasets_config import get_dataset_info # Use the function to get dataset info
-# Removed: from qm9.utils import prepare_context
+from . import lipid_dataset
+from .configs.datasets_config import get_dataset_info
+
 
 # Original GeoLDM imports
 import copy
-import utils # Original GeoLDM utils
+from . import utils
 import argparse
 import wandb
 import os
 from os.path import join
-from core.models import get_optim, get_latent_diffusion # Import model getter
-from equivariant_diffusion import en_diffusion # For type checking
-from equivariant_diffusion import utils as diffusion_utils
-from core import losses as qm9_losses # Import the loss computation (keeping alias qm9_losses for stability)
+from .core.models import get_optim, get_latent_diffusion
+from .equivariant_diffusion import en_diffusion
+from .equivariant_diffusion import utils as diffusion_utils
+from .core import losses as qm9_losses
 import torch
 import time
 import pickle
 from tqdm import tqdm
-import numpy as np # Added for np.mean
+import numpy as np
 
 # Define arguments specific to Stage 1 Adaptation
 parser = argparse.ArgumentParser(description='GeoLDM Lipid Adaptation (Stage 1 - Unlabeled)')

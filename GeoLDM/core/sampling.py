@@ -3,7 +3,9 @@ import torch
 import torch.nn.functional as F
 from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked
-from qm9.analyze import check_stability
+from GeoLDM.core.analyze import check_stability
+from GeoLDM.core.models import get_model
+from tqdm import tqdm
 
 
 def rotate_chain(z):
@@ -168,4 +170,52 @@ def sample_sweep_conditional(args, device, generative_model, dataset_info, prop_
     context = torch.cat(context, dim=1).float().to(device)
 
     one_hot, charges, x, node_mask = sample(args, device, generative_model, dataset_info, prop_dist, nodesxsample=nodesxsample, context=context, fix_noise=True)
+    return one_hot, charges, x, node_mask
+
+
+@torch.no_grad()
+def sample(args, device, generative_model, dataset_info, prop_dist=None,
+           nodes_dist=None, save_traj=False):
+    max_n_nodes = dataset_info['max_n_nodes']  # this is the maximum node_size in QM9
+
+    assert int(torch.max(nodes_dist)) <= max_n_nodes
+    batch_size = len(nodes_dist)
+
+    node_mask = torch.zeros(batch_size, max_n_nodes)
+    for i in range(batch_size):
+        node_mask[i, 0:nodes_dist[i]] = 1
+
+    # Compute edge_mask
+
+    edge_mask = node_mask.unsqueeze(1) * node_mask.unsqueeze(2)
+    diag_mask = ~torch.eye(edge_mask.size(1), dtype=torch.bool).unsqueeze(0)
+    edge_mask *= diag_mask
+    edge_mask = edge_mask.view(batch_size * max_n_nodes * max_n_nodes, 1).to(device)
+    node_mask = node_mask.unsqueeze(2).to(device)
+
+    # TODO FIX: This conditioning just zeros.
+    if args.context_node_nf > 0:
+        if prop_dist is None:
+            prop_dist = get_model(args.dataset)
+        context = prop_dist.sample_batch(nodes_dist)
+        context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
+    else:
+        context = None
+
+    if args.probabilistic_model == 'diffusion':
+        x, h = generative_model.sample(batch_size, max_n_nodes, node_mask, edge_mask, context, fix_noise=False)
+
+        assert_correctly_masked(x, node_mask)
+        assert_mean_zero_with_mask(x, node_mask)
+
+        one_hot = h['categorical']
+        charges = h['integer']
+
+        assert_correctly_masked(one_hot.float(), node_mask)
+        if args.include_charges:
+            assert_correctly_masked(charges.float(), node_mask)
+
+    else:
+        raise ValueError(args.probabilistic_model)
+
     return one_hot, charges, x, node_mask

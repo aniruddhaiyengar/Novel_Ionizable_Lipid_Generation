@@ -5,11 +5,15 @@ import glob
 import random
 import matplotlib
 import imageio
+from rdkit import Chem
+from rdkit.Chem import Draw
+import networkx as nx
+import seaborn as sns
 
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from qm9 import bond_analyze
+from GeoLDM.core import bond_analyze
 ##############
 ### Files ####
 ###########-->
@@ -395,7 +399,7 @@ def visualize_chain_uncertainty(
 
 if __name__ == '__main__':
     #plot_grid()
-    import qm9.dataset as dataset
+    import core.dataset as dataset
     from configs.datasets_config import qm9_with_h, geom_with_h
     matplotlib.use('macosx')
 
@@ -450,3 +454,9 @@ if __name__ == '__main__':
 
     else:
         raise ValueError(dataset)
+
+
+class MolecularVisualization():
+    def __init__(self, dataset_info, device):
+        self.dataset_info = dataset_info
+        self.device = device

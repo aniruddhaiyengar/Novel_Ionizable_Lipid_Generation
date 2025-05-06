@@ -1,0 +1,8 @@
+*.pt
+*.sdf
+/data/structures.sdf
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class 
