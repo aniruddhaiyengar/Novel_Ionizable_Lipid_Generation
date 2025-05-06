@@ -4,31 +4,29 @@ Fine-tuning script for GeoLDM on lipid data with transfection_score conditioning
 Based on main_geom_drugs.py and train_test.py from the original GeoLDM codebase.
 '''
 
-# Rdkit import should be first, do not move it
 from rdkit import Chem
 
 
 # Local imports
-import lipid_dataset # Import our new dataset module
-from configs.datasets_config import get_dataset_info # Use the function to get dataset info
-from core.utils import prepare_context # Import the modified prepare_context
+from . import lipid_dataset
+from .configs.datasets_config import get_dataset_info
+from .core.utils import prepare_context
 
-# Original GeoLDM imports
 import copy
-import utils # Original GeoLDM utils
+from . import utils
 import argparse
 import wandb
 import os
 from os.path import join
-from core.models import get_optim, get_latent_diffusion # Import model getter
-from equivariant_diffusion import en_diffusion # For type checking
-from equivariant_diffusion import utils as diffusion_utils
-from core import losses as qm9_losses # Import the loss computation (keeping alias qm9_losses for stability)
+from .core.models import get_optim, get_latent_diffusion
+from .equivariant_diffusion import en_diffusion
+from .equivariant_diffusion import utils as diffusion_utils
+from .core import losses as qm9_losses
 import torch
 import time
 import pickle
 from tqdm import tqdm
-import numpy as np # Added for np.mean
+import numpy as np
 
 # Define arguments specific to fine-tuning or conditioning
 parser = argparse.ArgumentParser(description='GeoLDM Lipid Fine-tuning')

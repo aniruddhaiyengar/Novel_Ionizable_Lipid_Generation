@@ -31,6 +31,7 @@ def generate_conformer(smiles):
     """
     Generates a 3D conformer for a given SMILES string using RDKit ETKDG.
     Adds hydrogens and computes Gasteiger charges.
+    Tries fallback methods if ETKDG fails.
 
     Args:
         smiles (str): The SMILES string of the molecule.
@@ -49,26 +50,44 @@ def generate_conformer(smiles):
         # Add hydrogens
         mol = Chem.AddHs(mol)
 
-        # Generate 3D coordinates using ETKDGv3 algorithm
-        params = AllChem.ETKDGv3()
-        params.randomSeed = 42 # Ensure reproducibility
-        conf_id = AllChem.EmbedMolecule(mol, params)
+        # --- Attempt 1: ETKDGv3 with seed ---
+        params_seed = AllChem.ETKDGv3()
+        params_seed.randomSeed = 42 # Ensure reproducibility
+        params_seed.useRandomCoords = False # Default ETKDG
+        conf_id = AllChem.EmbedMolecule(mol, params_seed)
 
+        # --- Attempt 2: ETKDGv3 without seed ---
         if conf_id < 0:
-            print(f"Warning: Could not generate conformer for SMILES: {smiles}")
-            # Try without random seed as a fallback
-            params = AllChem.ETKDGv3()
-            conf_id = AllChem.EmbedMolecule(mol, params)
-            if conf_id < 0:
-                 print(f"Warning: Conformer generation failed even without seed for SMILES: {smiles}")
-                 return None
+            print(f"Warning: ETKDGv3 (seed 42) failed for SMILES: {smiles}. Trying without seed.")
+            params_no_seed = AllChem.ETKDGv3()
+            params_no_seed.useRandomCoords = False
+            conf_id = AllChem.EmbedMolecule(mol, params_no_seed)
+
+        # --- Attempt 3: ETKDGv3 with random coordinates ---
+        if conf_id < 0:
+            print(f"Warning: ETKDGv3 (no seed) failed for SMILES: {smiles}. Trying with random coords.")
+            params_random = AllChem.ETKDGv3()
+            # Use seed for reproducibility even with random coords
+            params_random.randomSeed = 42
+            params_random.useRandomCoords = True
+            conf_id = AllChem.EmbedMolecule(mol, params_random)
+
+        # --- Check final result --- 
+        if conf_id < 0:
+             print(f"Error: Conformer generation failed for SMILES: {smiles} after all attempts. Skipping.")
+             return None
+        else:
+            print(f"Success: Conformer generated for SMILES: {smiles} (attempt result code: {conf_id})")
 
         # Optimize the geometry using MMFF94 force field
         try:
-            AllChem.MMFFOptimizeMolecule(mol, confId=conf_id)
+            opt_result = AllChem.MMFFOptimizeMolecule(mol, confId=conf_id)
+            # Optional: Check opt_result, 0 is success, 1 means optimization failed to converge
+            if opt_result != 0:
+                 print(f"Warning: MMFF optimization did not converge (result code {opt_result}) for SMILES: {smiles}. Using best found conformer.")
         except Exception as e:
             # Sometimes optimization can fail, but the embedded conformer might still be usable
-            print(f"Warning: MMFF optimization failed for SMILES: {smiles}. Using unoptimized conformer. Error: {e}")
+            print(f"Warning: MMFF optimization failed unexpectedly for SMILES: {smiles}. Using unoptimized conformer. Error: {e}")
 
 
         # Compute Gasteiger charges (often used in ML models)
@@ -85,6 +104,8 @@ def generate_conformer(smiles):
         return mol
     except Exception as e:
         print(f"Error processing SMILES {smiles}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def process_molecule(mol, target_score):

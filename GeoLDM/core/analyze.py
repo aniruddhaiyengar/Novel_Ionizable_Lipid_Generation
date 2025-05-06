@@ -1,17 +1,17 @@
 try:
     from rdkit import Chem
-    from qm9.rdkit_functions import BasicMolecularMetrics
+    from core.rdkit_functions import BasicMolecularMetrics
     use_rdkit = True
 except ModuleNotFoundError:
     use_rdkit = False
-import qm9.dataset as dataset
+import GeoLDM.core.dataset as dataset
 import torch
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as sp_stats
-from qm9 import bond_analyze
+from GeoLDM.core import bond_analyze
 
 
 # 'atom_decoder': ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'],
@@ -261,7 +261,7 @@ def process_loader(dataloader):
 
 def main_check_stability(remove_h: bool, batch_size=32):
     from configs import datasets_config
-    import qm9.dataset as dataset
+    import GeoLDM.core.dataset as dataset
 
     class Config:
         def __init__(self):
@@ -280,7 +280,7 @@ def main_check_stability(remove_h: bool, batch_size=32):
     dataset_info = datasets_config.qm9_with_h
     dataloaders, charge_scale = dataset.retrieve_dataloaders(cfg)
     if use_rdkit:
-        from qm9.rdkit_functions import BasicMolecularMetrics
+        from core.rdkit_functions import BasicMolecularMetrics
         metrics = BasicMolecularMetrics(dataset_info)
 
     atom_decoder = dataset_info['atom_decoder']

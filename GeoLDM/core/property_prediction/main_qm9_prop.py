@@ -1,12 +1,12 @@
 import sys, os
-sys.path.append(os.path.abspath(os.path.join('../../')))
-from qm9.property_prediction.models_property import EGNN, Naive, NumNodes
+from GeoLDM.core.property_prediction.models_property import EGNN, Naive, NumNodes
+# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))) # Removed sys.path modification
 import torch
 from torch import nn, optim
 import argparse
-from qm9.property_prediction import prop_utils
+from GeoLDM.core.property_prediction import prop_utils
 import json
-from qm9 import dataset, utils
+from GeoLDM.core import dataset, utils
 import pickle
 
 loss_l1 = nn.L1Loss()
@@ -152,8 +152,8 @@ if __name__ == "__main__":
                         help='maximum power to take into one-hot features')
     parser.add_argument('--dataset', type=str, default="qm9_first_half", metavar='N',
                         help='qm9_first_half')
-    parser.add_argument('--datadir', type=str, default="../../qm9/temp", metavar='N',
-                        help='qm9_first_half')
+    parser.add_argument('--datadir', type=str, default="GeoLDM/qm9/temp", metavar='N',
+                        help='qm9 data directory relative to project root')
     parser.add_argument('--remove_h', action='store_true')
     parser.add_argument('--include_charges', type=eval, default=True, help='include atom charge or not')
     parser.add_argument('--node_attr', type=int, default=0, metavar='N',

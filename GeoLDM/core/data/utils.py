@@ -3,14 +3,15 @@ import numpy as np
 
 import logging
 import os
+import pickle
 
 from torch.utils.data import DataLoader
-from qm9.data.dataset_class import ProcessedDataset
-from qm9.data.prepare import prepare_dataset
+from GeoLDM.core.data.dataset_class import ProcessedDataset
+from GeoLDM.core.data.prepare import prepare_dataset
 
 
 def initialize_datasets(args, datadir, dataset, subset=None, splits=None,
-                        force_download=False, subtract_thermo=False,
+                        force_download=False, subtract_thermo=True,
                         remove_h=False):
     """
     Initialize datasets.

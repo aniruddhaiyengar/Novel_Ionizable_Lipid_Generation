@@ -3,10 +3,13 @@ import urllib.request
 
 import numpy as np
 import torch
+import os
+import logging
+import pickle
 
-import logging, os, urllib
+import urllib
 
-from qm9.data.prepare.utils import download_data, is_int, cleanup_file
+from GeoLDM.core.data.prepare.utils import download_data, is_int, cleanup_file
 
 md17_base_url = 'http://quantum-machine.org/gdml/data/npz/'
 
@@ -108,3 +111,6 @@ def gen_splits_md17(num_pts):
     splits['test'] = torch.tensor(data_perm[mask_test])
 
     return splits
+
+def check_md17_available(path):
+    return os.path.exists(os.path.join(path, "aspirin_dft.npz"))

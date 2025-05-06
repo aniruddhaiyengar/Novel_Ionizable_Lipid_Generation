@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import BatchSampler, DataLoader, Dataset, SequentialSampler
 import argparse
-from qm9.data import collate as qm9_collate
+from GeoLDM.core.data import collate as qm9_collate
 
 
 def extract_conformers(args):
@@ -65,14 +65,14 @@ def extract_conformers(args):
     print("Dataset processed.")
 
 
-def load_split_data(conformation_file, val_proportion=0.1, test_proportion=0.1,
-                    filter_size=None):
+def load_split_data(data_file, val_proportion=0.1, test_proportion=0.1, seed=42, filter_size=None):
+    """Load the dataset and split based on provided proportions."""
     from pathlib import Path
-    path = Path(conformation_file)
+    path = Path(data_file)
     base_path = path.parent.absolute()
 
-    # base_path = os.path.dirname(conformation_file)
-    all_data = np.load(conformation_file)  # 2d array: num_atoms x 5
+    # base_path = os.path.dirname(data_file)
+    all_data = np.load(data_file)  # 2d array: num_atoms x 5
 
     mol_id = all_data[:, 0].astype(int)
     conformers = all_data[:, 1:]
