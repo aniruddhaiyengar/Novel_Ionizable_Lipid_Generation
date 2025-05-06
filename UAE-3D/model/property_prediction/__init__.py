@@ -1,1 +1,0 @@
-from .egnn import EGNN
