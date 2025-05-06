@@ -21,9 +21,11 @@ STATS_PKL = os.path.join(OUTPUT_DIR, "lipid_stats.pkl") # Output for dataset sta
 # Define the atom types expected in the dataset (adjust if necessary)
 # This order determines the one-hot encoding index.
 # H, C, N, O are standard; P is common in lipids. F was in QM9 but less likely here.
-ATOM_DECODER = ['H', 'C', 'N', 'O', 'P']
+# ATOM_DECODER = ['H', 'C', 'N', 'O', 'P'] # Original 5 types
+# New ATOM_DECODER to match geom_with_h from GeoLDM/configs/datasets_config.py
+ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
-NUM_ATOM_TYPES = len(ATOM_DECODER)
+NUM_ATOM_TYPES = len(ATOM_DECODER) # Should be 16
 
 # --- Functions ---
 
@@ -74,8 +76,8 @@ def generate_conformer(smiles):
 
         # --- Check final result --- 
         if conf_id < 0:
-             print(f"Error: Conformer generation failed for SMILES: {smiles} after all attempts. Skipping.")
-             return None
+            print(f"Error: Conformer generation failed for SMILES: {smiles} after all attempts. Skipping.")
+            return None
         else:
             print(f"Success: Conformer generated for SMILES: {smiles} (attempt result code: {conf_id})")
 
@@ -94,11 +96,11 @@ def generate_conformer(smiles):
         try:
             AllChem.ComputeGasteigerCharges(mol)
         except Exception as e:
-             # Handle potential errors during charge calculation
-             print(f"Warning: Could not compute Gasteiger charges for SMILES: {smiles}. Charges will be set to 0. Error: {e}")
-             # Assign a default charge of 0.0 if calculation fails
-             for atom in mol.GetAtoms():
-                 atom.SetDoubleProp('_GasteigerCharge', 0.0)
+            # Handle potential errors during charge calculation
+            print(f"Warning: Could not compute Gasteiger charges for SMILES: {smiles}. Charges will be set to 0. Error: {e}")
+            # Assign a default charge of 0.0 if calculation fails
+            for atom in mol.GetAtoms():
+                atom.SetDoubleProp('_GasteigerCharge', 0.0)
 
 
         return mol
@@ -127,9 +129,15 @@ def process_molecule(mol, target_score):
         positions = conformer.GetPositions() # Get atom coordinates (NumAtoms x 3)
 
         num_atoms = mol.GetNumAtoms()
-        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES))
-        charges = np.zeros((num_atoms, 1))
-        atom_mask = np.ones((num_atoms, 1)) # Mask indicating which atoms are real
+        # one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES))
+        # charges = np.zeros((num_atoms, 1))
+        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32) # Will be (num_atoms, 16)
+        
+        # To match GEOM's include_charges=False behavior where charges don't add to feature dim:
+        actual_gasteiger_charges = np.zeros((num_atoms, 1), dtype=np.float32) 
+        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dimensional feature
+        
+        atom_mask = np.ones((num_atoms, 1), dtype=np.float32) # Mask indicating which atoms are real
 
         # Extract atom features
         valid_molecule = True
@@ -137,16 +145,17 @@ def process_molecule(mol, target_score):
             # Get atomic symbol (e.g., 'C', 'H')
             symbol = atom.GetSymbol()
             if symbol not in ATOM_MAP:
-                 print(f"Warning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule.")
-                 valid_molecule = False
-                 break # Stop processing this molecule
+                print(f"Warning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule.")
+                valid_molecule = False
+                break # Stop processing this molecule
 
             # One-hot encode atom type
             one_hot[i, ATOM_MAP[symbol]] = 1
 
             # Get Gasteiger charge (handle potential missing property)
             charge = atom.GetDoubleProp('_GasteigerCharge') if atom.HasProp('_GasteigerCharge') else 0.0
-            charges[i, 0] = charge
+            # charges[i, 0] = charge
+            actual_gasteiger_charges[i, 0] = charge # Store calculated Gasteiger charge separately
 
         if not valid_molecule:
             return None
@@ -154,10 +163,13 @@ def process_molecule(mol, target_score):
         # Prepare data dictionary matching typical GeoLDM input structure
         data = {
             'positions': positions.astype(np.float32), # Ensure float32
-            'one_hot': one_hot.astype(np.float32),     # Ensure float32
-            'charges': charges.astype(np.float32),     # Ensure float32
+            'one_hot': one_hot.astype(np.float32),     # This is (N, 16)
+            # 'charges': charges.astype(np.float32),     # Original
+            'charges': output_charges_feature,          # This is (N, 0)
             'atom_mask': atom_mask.astype(np.float32), # Ensure float32
-            CONDITIONING_KEY: float(target_score)      # Store the target property
+            CONDITIONING_KEY: float(target_score),      # Store the target property
+            # Optionally, we could store the actual Gasteiger charges under a different key if needed for analysis
+            # 'gasteiger_charges_raw': actual_gasteiger_charges 
         }
         return data
     except Exception as e:

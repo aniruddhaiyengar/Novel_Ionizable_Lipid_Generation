@@ -13,9 +13,11 @@ PROCESSED_UNLABELED_PKL = os.path.join(OUTPUT_DIR, "processed_unlabeled_lipids.p
 MAX_MOLECULES_TO_PROCESS = 10000  # Stop after processing this many molecules
 
 # Define the atom types expected in the dataset (ensure consistency with other scripts)
-ATOM_DECODER = ['H', 'C', 'N', 'O', 'P']
+# ATOM_DECODER = ['H', 'C', 'N', 'O', 'P'] # Original 5 types
+# New ATOM_DECODER to match geom_with_h from GeoLDM/configs/datasets_config.py
+ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
-NUM_ATOM_TYPES = len(ATOM_DECODER)
+NUM_ATOM_TYPES = len(ATOM_DECODER) # Should be 16
 
 # --- Functions (Adapted from preprocess_lipids.py) ---
 
@@ -94,10 +96,10 @@ def generate_conformer_from_mol(mol):
         try:
             AllChem.ComputeGasteigerCharges(mol)
         except Exception as e:
-             print(f"Warning: Could not compute Gasteiger charges for {mol_name}. Charges will be set to 0. Error: {e}")
-             # Assign a default charge of 0.0 if calculation fails
-             for atom in mol.GetAtoms():
-                 atom.SetDoubleProp('_GasteigerCharge', 0.0)
+            print(f"Warning: Could not compute Gasteiger charges for {mol_name}. Charges will be set to 0. Error: {e}")
+            # Assign a default charge of 0.0 if calculation fails
+            for atom in mol.GetAtoms():
+                atom.SetDoubleProp('_GasteigerCharge', 0.0)
 
         return mol
     except Exception as e:
@@ -125,9 +127,16 @@ def process_molecule(mol):
         positions = conformer.GetPositions() # Get atom coordinates (NumAtoms x 3)
 
         num_atoms = mol.GetNumAtoms()
-        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES))
-        charges = np.zeros((num_atoms, 1))
-        atom_mask = np.ones((num_atoms, 1)) # Mask indicating which atoms are real
+        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32) # Will be (num_atoms, 16)
+        # charges = np.zeros((num_atoms, 1)) # Original: Gasteiger charge as 1 feature
+        
+        # To match GEOM's include_charges=False behavior where charges don't add to feature dim:
+        # We'll still calculate Gasteiger for potential future use or inspection,
+        # but the 'charges' field in the output dict will be 0-dimensional.
+        actual_gasteiger_charges = np.zeros((num_atoms, 1), dtype=np.float32) 
+        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dimensional feature
+
+        atom_mask = np.ones((num_atoms, 1), dtype=np.float32) # Mask indicating which atoms are real
 
         # Extract atom features
         valid_molecule = True
@@ -135,21 +144,22 @@ def process_molecule(mol):
             # Get atomic symbol
             symbol = atom.GetSymbol()
             if symbol not in ATOM_MAP:
-                 # Print only once per run for a given symbol to avoid flooding
-                 if not hasattr(process_molecule, "warned_symbols"):
-                      process_molecule.warned_symbols = set()
-                 if symbol not in process_molecule.warned_symbols:
-                      print(f"\nWarning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule(s) with this atom type.")
-                      process_molecule.warned_symbols.add(symbol)
-                 valid_molecule = False
-                 break # Stop processing this molecule
+                # Print only once per run for a given symbol to avoid flooding
+                if not hasattr(process_molecule, "warned_symbols"):
+                    process_molecule.warned_symbols = set()
+                if symbol not in process_molecule.warned_symbols:
+                    print(f"\nWarning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule(s) with this atom type.")
+                    process_molecule.warned_symbols.add(symbol)
+                valid_molecule = False
+                break # Stop processing this molecule
 
             # One-hot encode atom type
             one_hot[i, ATOM_MAP[symbol]] = 1
 
             # Get Gasteiger charge
             charge = atom.GetDoubleProp('_GasteigerCharge') if atom.HasProp('_GasteigerCharge') else 0.0
-            charges[i, 0] = charge
+            # charges[i, 0] = charge # Store in original charges array
+            actual_gasteiger_charges[i, 0] = charge # Store calculated Gasteiger charge separately
 
         if not valid_molecule:
             return None
@@ -157,10 +167,13 @@ def process_molecule(mol):
         # Prepare data dictionary
         data = {
             'positions': positions.astype(np.float32),
-            'one_hot': one_hot.astype(np.float32),
-            'charges': charges.astype(np.float32),
+            'one_hot': one_hot.astype(np.float32), # This is (N, 16)
+            # 'charges': charges.astype(np.float32), # Original
+            'charges': output_charges_feature, # This is (N, 0)
             'atom_mask': atom_mask.astype(np.float32)
             # No conditioning key needed here
+            # Optionally, we could store the actual Gasteiger charges under a different key if needed for analysis
+            # 'gasteiger_charges_raw': actual_gasteiger_charges 
         }
         return data
     except AttributeError:

@@ -23,7 +23,7 @@ A two-stage fine-tuning approach is employed:
 
     Install core libraries (PyTorch, CUDA, RDKit):
     ```bash
-    conda install -c pytorch -c nvidia -c conda-forge python=3.10 pytorch=2.1.2 torchvision=0.16.2 torchaudio=2.1.2 pytorch-cuda=11.8 rdkit=2023.09.5 numpy=1.26.0
+    conda install -c pytorch -c nvidia -c conda-forge python=3.10 pytorch=2.0.0 torchvision=0.15.0 torchaudio pytorch-cuda=11.8 rdkit=2023.09.5 numpy=1.26.0
     ```
 
     Install other dependencies:
@@ -98,16 +98,19 @@ Follow these steps sequentially.
     *   Pre-trained GEOM-Drugs model (assumed path: `GeoLDM/drugs_latent2/`)
 *   **Command** (adjust paths, epochs, batch size, LR as needed):
     ```bash
-    python GeoLDM/stage1_adapt_lipids.py \
+    python -m GeoLDM.stage1_adapt_lipids \
         --unlabeled_data_path "data/processed_unlabeled_lipids.pkl" \
         --pretrained_path "GeoLDM/drugs_latent2/" \
         --model_name "generative_model_ema.npy" \
         --exp_name "lipid_adapt_stage1_run1" \
         --output_dir "outputs/stage1_adapt" \
         --n_epochs 50 \
-        --batch_size 32 \
-        --lr 1e-5 \
-        --val_split_ratio 0.01 
+        --batch_size 4 \
+        --no-condition_time_cmd  \
+        --lr 1e-6 \
+        --no-trainable_ae_cmd \
+        --val_split_ratio 0.01 &> outputs/lipid_adapt_stage1_run1/experiment_full.log
+        
     ```
 *   **Output**: Saves adapted model checkpoints (e.g., `stage1_adapted_ema_best.npy`) into `outputs/stage1_adapt/lipid_adapt_stage1_run1/checkpoints/`.
 

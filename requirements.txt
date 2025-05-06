@@ -14,9 +14,6 @@ ml_collections==0.1.1
 pymatgen==2023.9.10
 scikit-learn>=1.3.0
 umap-learn==0.5.3
-mkl-fft>=1.3.6
-mkl-random
-mkl-service
 numexpr==2.8.3
 ipykernel==6.15.2
 ipython==8.4.0

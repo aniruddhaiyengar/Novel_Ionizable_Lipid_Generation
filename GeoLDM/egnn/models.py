@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from egnn.egnn_new import EGNN, GNN
-from equivariant_diffusion.utils import remove_mean, remove_mean_with_mask
+from GeoLDM.egnn.egnn_new import EGNN, GNN
+from GeoLDM.equivariant_diffusion.utils import remove_mean, remove_mean_with_mask
 import numpy as np
 
 
@@ -14,17 +14,31 @@ class EGNN_dynamics_QM9(nn.Module):
         super().__init__()
         self.mode = mode
         if mode == 'egnn_dynamics':
+            # Calculate effective input node features for the EGNN core
+            effective_in_node_nf_for_core_egnn = in_node_nf + context_node_nf
+            if condition_time:
+                effective_in_node_nf_for_core_egnn += 1
+
             self.egnn = EGNN(
-                in_node_nf=in_node_nf + context_node_nf, in_edge_nf=1,
+                in_node_nf=effective_in_node_nf_for_core_egnn, # Corrected calculation
+                in_edge_nf=1,
                 hidden_nf=hidden_nf, device=device, act_fn=act_fn,
                 n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                 inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
                 normalization_factor=normalization_factor,
                 aggregation_method=aggregation_method)
-            self.in_node_nf = in_node_nf
+            self.in_node_nf = in_node_nf # This stores the original in_node_nf for other uses if any
         elif mode == 'gnn_dynamics':
+            # For GNN, the time embedding is typically handled differently or not at all for h
+            # Ensure this part is consistent if condition_time is also relevant for GNN mode
+            effective_in_node_nf_for_gnn = in_node_nf + context_node_nf + 3 # +3 for positions
+            # If GNN also uses time conditioning on 'h' similarly, it might need:
+            # if condition_time:
+            #     effective_in_node_nf_for_gnn += 1 (for the h part, not x part)
+
             self.gnn = GNN(
-                in_node_nf=in_node_nf + context_node_nf + 3, in_edge_nf=0,
+                in_node_nf=effective_in_node_nf_for_gnn, 
+                in_edge_nf=0,
                 hidden_nf=hidden_nf, out_node_nf=3 + in_node_nf, device=device,
                 act_fn=act_fn, n_layers=n_layers, attention=attention,
                 normalization_factor=normalization_factor, aggregation_method=aggregation_method)
@@ -66,8 +80,8 @@ class EGNN_dynamics_QM9(nn.Module):
                 h_time = torch.empty_like(h[:, 0:1]).fill_(t.item())
             else:
                 # t is different over the batch dimension.
-                h_time = t.view(bs, 1).repeat(1, n_nodes)
-                h_time = h_time.view(bs * n_nodes, 1)
+                h_time = t.view(bs, 1).repeat(1, n_nodes).view(bs * n_nodes, 1)
+            print(f"DEBUG [EGNN_dynamics_QM9._forward]: h_time stats: mean={h_time.mean():.4f}, std={h_time.std():.4f}, min={h_time.min():.4f}, max={h_time.max():.4f}")
             h = torch.cat([h, h_time], dim=1)
 
         if context is not None:
@@ -75,8 +89,12 @@ class EGNN_dynamics_QM9(nn.Module):
             context = context.view(bs*n_nodes, self.context_node_nf)
             h = torch.cat([h, context], dim=1)
 
+        print(f"DEBUG [EGNN_dynamics_QM9._forward]: Shape of h fed to self.egnn: {h.shape}, x shape: {x.shape}")
+        print(f"DEBUG [EGNN_dynamics_QM9._forward]: h (before egnn) stats: mean={h.mean():.4f}, std={h.std():.4f}, min={h.min():.4f}, max={h.max():.4f}")
+
         if self.mode == 'egnn_dynamics':
             h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask)
+            print(f"DEBUG [EGNN_dynamics_QM9._forward]: h_final (after egnn) stats: mean={h_final.mean():.4f}, std={h_final.std():.4f}, min={h_final.min():.4f}, max={h_final.max():.4f}")
             vel = (x_final - x) * node_mask  # This masking operation is redundant but just in case
         elif self.mode == 'gnn_dynamics':
             xh = torch.cat([x, h], dim=1)

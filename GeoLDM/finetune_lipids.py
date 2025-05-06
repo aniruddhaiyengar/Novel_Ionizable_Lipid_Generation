@@ -4,24 +4,32 @@ Fine-tuning script for GeoLDM on lipid data with transfection_score conditioning
 Based on main_geom_drugs.py and train_test.py from the original GeoLDM codebase.
 '''
 
+import sys
+import os
+# Add the parent directory (project root) to sys.path to allow absolute imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 from rdkit import Chem
 
 
 # Local imports
-from . import lipid_dataset
-from .configs.datasets_config import get_dataset_info
-from .core.utils import prepare_context
+import GeoLDM.lipid_dataset as lipid_dataset
+from GeoLDM.configs.datasets_config import get_dataset_info
+from GeoLDM.core.utils import prepare_context
 
 import copy
-from . import utils
+import GeoLDM.utils as utils
 import argparse
 import wandb
 import os
 from os.path import join
-from .core.models import get_optim, get_latent_diffusion
-from .equivariant_diffusion import en_diffusion
-from .equivariant_diffusion import utils as diffusion_utils
-from .core import losses as qm9_losses
+from GeoLDM.core.models import get_optim, get_latent_diffusion
+from GeoLDM.equivariant_diffusion import en_diffusion
+from GeoLDM.equivariant_diffusion import utils as diffusion_utils
+from GeoLDM.core import losses as qm9_losses
 import torch
 import time
 import pickle
@@ -194,8 +202,8 @@ if args.conditioning:
     try:
         dummy_batch = next(iter(dataloaders['train']))
         for key in dummy_batch:
-             if isinstance(dummy_batch[key], torch.Tensor):
-                 dummy_batch[key] = dummy_batch[key].to(device)
+            if isinstance(dummy_batch[key], torch.Tensor):
+                dummy_batch[key] = dummy_batch[key].to(device)
         dummy_context = prepare_context(args.conditioning, dummy_batch, property_norms, force_unconditional=False)
         if dummy_context is not None:
             context_node_nf = dummy_context.size(-1)
@@ -301,9 +309,9 @@ for epoch in range(args.n_epochs):
             use_uncond = torch.rand(1).item() < args.cfg_prob
             context = prepare_context(args.conditioning, data, property_norms, force_unconditional=use_uncond)
             if context is not None:
-                 # Ensure context is on the correct device
-                 context = context.to(device, dtype)
-                 diffusion_utils.assert_correctly_masked(context, node_mask) # From train_test
+                # Ensure context is on the correct device
+                context = context.to(device, dtype)
+                diffusion_utils.assert_correctly_masked(context, node_mask) # From train_test
 
         # --- Loss Calculation --- 
         optim.zero_grad()
@@ -338,9 +346,9 @@ for epoch in range(args.n_epochs):
             n_batches += 1
 
             if i % args.n_report_steps == 0:
-                 pbar.set_postfix({'Loss': loss.item(), 'NLL': nll.item(), 'Reg': reg_term.item(), 'GradNorm': f"{grad_norm:.1f}"})
-                 if not args.no_wandb:
-                     wandb.log({'batch_loss': loss.item(), 'batch_nll': nll.item(), 'batch_reg': reg_term.item(), 'grad_norm': grad_norm}, commit=False)
+                pbar.set_postfix({'Loss': loss.item(), 'NLL': nll.item(), 'Reg': reg_term.item(), 'GradNorm': f"{grad_norm:.1f}"})
+                if not args.no_wandb:
+                    wandb.log({'batch_loss': loss.item(), 'batch_nll': nll.item(), 'batch_reg': reg_term.item(), 'grad_norm': grad_norm}, commit=False)
 
         except Exception as e:
             print(f"Error during training batch {i}: {e}")
@@ -369,8 +377,8 @@ for epoch in range(args.n_epochs):
         val_nll = 0.0
         n_val_samples = 0
         with torch.no_grad():
-             pbar_val = tqdm(dataloaders['val'], desc=f"Validation Epoch {epoch+1}")
-             for data in pbar_val:
+            pbar_val = tqdm(dataloaders['val'], desc=f"Validation Epoch {epoch+1}")
+            for data in pbar_val:
                 # --- Validation Data Prep --- 
                 x = data['positions'].to(device, dtype)
                 batch_size = x.size(0)
@@ -386,19 +394,19 @@ for epoch in range(args.n_epochs):
                 if args.conditioning:
                     context = prepare_context(args.conditioning, data, property_norms, force_unconditional=False)
                     if context is not None:
-                         context = context.to(device, dtype)
-                         diffusion_utils.assert_correctly_masked(context, node_mask)
+                        context = context.to(device, dtype)
+                        diffusion_utils.assert_correctly_masked(context, node_mask)
                 
                 # --- Validation Loss Calculation --- 
                 try:
                      # Use the same loss function as training
-                     nll, _, _ = qm9_losses.compute_loss_and_nll(args, model_eval_dp, nodes_dist, x, h,
+                    nll, _, _ = qm9_losses.compute_loss_and_nll(args, model_eval_dp, nodes_dist, x, h,
                                                                  node_mask, edge_mask, context)
-                     if not torch.isnan(nll):
-                          val_nll += nll.item() * batch_size # Accumulate total NLL
-                          n_val_samples += batch_size
-                     else:
-                          print("Warning: NaN NLL encountered during validation.")
+                    if not torch.isnan(nll):
+                        val_nll += nll.item() * batch_size # Accumulate total NLL
+                        n_val_samples += batch_size
+                    else:
+                        print("Warning: NaN NLL encountered during validation.")
                 except Exception as e:
                     print(f"Error during validation batch: {e}")
                     # Continue validation

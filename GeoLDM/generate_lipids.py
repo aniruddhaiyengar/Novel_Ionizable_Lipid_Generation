@@ -1,24 +1,28 @@
-# Rdkit import should be first, do not move it
-try:
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-except ModuleNotFoundError:
-    pass
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+
+import sys
+import os
+# Add the parent directory (project root) to sys.path to allow absolute imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 import torch
 import pickle
 import numpy as np
 import argparse
-import os
 from os.path import join
 from tqdm import tqdm
 
 # GeoLDM imports
-from . import utils
-from .configs.datasets_config import get_dataset_info
-from .core.models import get_latent_diffusion
-from .core import visualizer as core_visualizer
-from .equivariant_diffusion.en_diffusion import sample_normal
+import GeoLDM.utils as utils
+from GeoLDM.configs.datasets_config import get_dataset_info
+from GeoLDM.core.models import get_latent_diffusion
+from GeoLDM.core import visualizer as core_visualizer
+from GeoLDM.equivariant_diffusion.en_diffusion import sample_normal
 
 
 def main():
@@ -135,9 +139,9 @@ def main():
         include_charges = model.include_charges
         print("Extracted dynamics, vae, gamma schedule from model.")
     except AttributeError as e:
-         print(f"Error accessing model components (e.g., dynamics, vae, gamma): {e}")
-         print("Ensure the loaded model is EnLatentDiffusion or EnVariationalDiffusion type.")
-         return
+        print(f"Error accessing model components (e.g., dynamics, vae, gamma): {e}")
+        print("Ensure the loaded model is EnLatentDiffusion or EnVariationalDiffusion type.")
+        return
 
     # --- Prepare Conditional Context --- 
     target_raw_score = mean_score + eval_args.target_score_std * std_score
@@ -165,8 +169,8 @@ def main():
             
             # Adjust context tensor size for the last batch if smaller
             if target_context.size(0) != current_batch_size:
-                 target_context = torch.ones(current_batch_size, 1, args.context_node_nf).to(device, dtype) * target_normalized_score
-                 null_context = torch.zeros(current_batch_size, 1, args.context_node_nf).to(device, dtype)
+                target_context = torch.ones(current_batch_size, 1, args.context_node_nf).to(device, dtype) * target_normalized_score
+                null_context = torch.zeros(current_batch_size, 1, args.context_node_nf).to(device, dtype)
 
             # Determine number of atoms for this batch
             if eval_args.num_atoms is not None:
