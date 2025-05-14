@@ -1,11 +1,12 @@
-import numpy as np
 import torch
+import numpy as np
 import torch.nn.functional as F
-from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
-    assert_correctly_masked
+from tqdm import tqdm
+from GeoLDM.equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
+    assert_correctly_masked, sample_center_gravity_zero_gaussian_with_mask
 from GeoLDM.core.analyze import check_stability
 from GeoLDM.core.models import get_model
-from tqdm import tqdm
+from GeoLDM.core.utils import prepare_context
 
 
 def rotate_chain(z):
@@ -62,11 +63,13 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
     else:
         raise ValueError()
 
-    # TODO FIX: This conditioning just zeros.
+    # Properly handle conditioning using property distribution
     if args.context_node_nf > 0:
-        context = prop_dist.sample(n_nodes).unsqueeze(1).unsqueeze(0)
-        context = context.repeat(1, n_nodes, 1).to(device)
-        #context = torch.zeros(n_samples, n_nodes, args.context_node_nf).to(device)
+        if prop_dist is not None:
+            context = prop_dist.sample(n_nodes).unsqueeze(1).unsqueeze(0)
+            context = context.repeat(1, n_nodes, 1).to(device)
+        else:
+            raise ValueError("Property distribution required for conditioning but not provided")
     else:
         context = None
 
@@ -129,11 +132,13 @@ def sample(args, device, generative_model, dataset_info,
     edge_mask = edge_mask.view(batch_size * max_n_nodes * max_n_nodes, 1).to(device)
     node_mask = node_mask.unsqueeze(2).to(device)
 
-    # TODO FIX: This conditioning just zeros.
+    # Properly handle conditioning using property distribution
     if args.context_node_nf > 0:
-        if context is None:
+        if prop_dist is not None:
             context = prop_dist.sample_batch(nodesxsample)
-        context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
+            context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
+        else:
+            raise ValueError("Property distribution required for conditioning but not provided")
     else:
         context = None
 
@@ -193,12 +198,13 @@ def sample(args, device, generative_model, dataset_info, prop_dist=None,
     edge_mask = edge_mask.view(batch_size * max_n_nodes * max_n_nodes, 1).to(device)
     node_mask = node_mask.unsqueeze(2).to(device)
 
-    # TODO FIX: This conditioning just zeros.
+    # Properly handle conditioning using property distribution
     if args.context_node_nf > 0:
-        if prop_dist is None:
-            prop_dist = get_model(args.dataset)
-        context = prop_dist.sample_batch(nodes_dist)
-        context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
+        if prop_dist is not None:
+            context = prop_dist.sample_batch(nodes_dist)
+            context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
+        else:
+            raise ValueError("Property distribution required for conditioning but not provided")
     else:
         context = None
 

@@ -1,10 +1,9 @@
-from equivariant_diffusion import utils
 import numpy as np
 import math
 import torch
-from egnn import models
+from GeoLDM.egnn import models
 from torch.nn import functional as F
-from equivariant_diffusion import utils as diffusion_utils
+from GeoLDM.equivariant_diffusion import utils as diffusion_utils
 
 
 # Defining some useful util functions.
@@ -312,8 +311,12 @@ class EnVariationalDiffusion(torch.nn.Module):
                 f'1 / norm_value = {1. / max_norm_value}')
 
     def phi(self, x, t, node_mask, edge_mask, context):
+        # Add debug print here
+        print(f"DEBUG [en_diffusion.phi]: Input x (z_t) shape: {x.shape}, t shape: {t.shape}, node_mask shape: {node_mask.shape}, context shape: {context.shape if context is not None else 'None'}")
+        print(f"DEBUG [en_diffusion.phi]: x (z_t) stats: mean={x.mean():.4f}, std={x.std():.4f}, min={x.min():.4f}, max={x.max():.4f}")
+        print(f"DEBUG [en_diffusion.phi]: t stats: mean={t.mean():.4f}, std={t.std():.4f}, min={t.min():.4f}, max={t.max():.4f}")
         net_out = self.dynamics._forward(t, x, node_mask, edge_mask, context)
-
+        print(f"DEBUG [en_diffusion.phi]: net_out (predicted noise/x0) stats: mean={net_out.mean():.4f}, std={net_out.std():.4f}, min={net_out.min():.4f}, max={net_out.max():.4f}")
         return net_out
 
     def inflate_batch_array(self, array, target):

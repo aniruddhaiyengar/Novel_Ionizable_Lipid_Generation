@@ -149,7 +149,7 @@ class EquivariantBlock(nn.Module):
 
 class EGNN(nn.Module):
     def __init__(self, in_node_nf, in_edge_nf, hidden_nf, device='cpu', act_fn=nn.SiLU(), n_layers=3, attention=False,
-                 norm_diff=True, out_node_nf=None, tanh=False, coords_range=15, norm_constant=1, inv_sublayers=2,
+                 norm_diff=True, out_node_nf=None, tanh=False, coords_range=5.0, norm_constant=1, inv_sublayers=2,
                  sin_embedding=False, normalization_factor=100, aggregation_method='sum'):
         super(EGNN, self).__init__()
         if out_node_nf is None:

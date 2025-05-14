@@ -5,6 +5,7 @@ import os
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from tqdm import tqdm
+import logging
 
 # --- Configuration ---
 TRAIN_CSV_PATH = "data/train.csv" # Input training CSV file path
@@ -20,8 +21,8 @@ STATS_PKL = os.path.join(OUTPUT_DIR, "lipid_stats.pkl") # Output for dataset sta
 
 # Define the atom types expected in the dataset (adjust if necessary)
 # This order determines the one-hot encoding index.
-# H, C, N, O are standard; P is common in lipids. F was in QM9 but less likely here.
-ATOM_DECODER = ['H', 'C', 'N', 'O', 'P']
+# Match exactly with the model's atom decoder
+ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
 NUM_ATOM_TYPES = len(ATOM_DECODER)
 
@@ -30,8 +31,8 @@ NUM_ATOM_TYPES = len(ATOM_DECODER)
 def generate_conformer(smiles):
     """
     Generates a 3D conformer for a given SMILES string using RDKit ETKDG.
-    Adds hydrogens and computes Gasteiger charges.
-    Tries fallback methods if ETKDG fails.
+    Computes Gasteiger charges. Tries fallback methods if ETKDG fails.
+    Note: Does not add hydrogens as we're working with molecules without hydrogens.
 
     Args:
         smiles (str): The SMILES string of the molecule.
@@ -47,8 +48,7 @@ def generate_conformer(smiles):
             print(f"Warning: Could not parse SMILES: {smiles}")
             return None
 
-        # Add hydrogens
-        mol = Chem.AddHs(mol)
+        # Note: We don't add hydrogens here since we're working with molecules without hydrogens
 
         # --- Attempt 1: ETKDGv3 with seed ---
         params_seed = AllChem.ETKDGv3()
@@ -127,41 +127,41 @@ def process_molecule(mol, target_score):
         positions = conformer.GetPositions() # Get atom coordinates (NumAtoms x 3)
 
         num_atoms = mol.GetNumAtoms()
-        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES))
-        charges = np.zeros((num_atoms, 1))
-        atom_mask = np.ones((num_atoms, 1)) # Mask indicating which atoms are real
+        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32) # Will be (num_atoms, 16)
+        
+        # To match GEOM's include_charges=False behavior where charges don't add to feature dim:
+        actual_gasteiger_charges = np.zeros((num_atoms, 1), dtype=np.float32) 
+        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dimensional feature
+        
+        atom_mask = np.ones((num_atoms, 1), dtype=np.float32) # Mask indicating which atoms are real
 
         # Extract atom features
         valid_molecule = True
         for i, atom in enumerate(mol.GetAtoms()):
-            # Get atomic symbol (e.g., 'C', 'H')
-            symbol = atom.GetSymbol()
-            if symbol not in ATOM_MAP:
-                 print(f"Warning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule.")
-                 valid_molecule = False
-                 break # Stop processing this molecule
-
-            # One-hot encode atom type
-            one_hot[i, ATOM_MAP[symbol]] = 1
-
-            # Get Gasteiger charge (handle potential missing property)
-            charge = atom.GetDoubleProp('_GasteigerCharge') if atom.HasProp('_GasteigerCharge') else 0.0
-            charges[i, 0] = charge
+            atom_symbol = atom.GetSymbol()
+            if atom_symbol not in ATOM_MAP:
+                logging.warning(f"Invalid atom type {atom_symbol} found in molecule. Skipping.")
+                valid_molecule = False
+                break
+            one_hot[i, ATOM_MAP[atom_symbol]] = 1
+            actual_gasteiger_charges[i] = atom.GetFormalCharge()
 
         if not valid_molecule:
             return None
 
-        # Prepare data dictionary matching typical GeoLDM input structure
-        data = {
-            'positions': positions.astype(np.float32), # Ensure float32
-            'one_hot': one_hot.astype(np.float32),     # Ensure float32
-            'charges': charges.astype(np.float32),     # Ensure float32
-            'atom_mask': atom_mask.astype(np.float32), # Ensure float32
-            CONDITIONING_KEY: float(target_score)      # Store the target property
+        # Create the output dictionary
+        molecule_data = {
+            'positions': positions,
+            'one_hot': one_hot,
+            'charges': output_charges_feature,  # Empty feature as per GEOM
+            'atom_mask': atom_mask,
+            CONDITIONING_KEY: target_score
         }
-        return data
+
+        return molecule_data
+
     except Exception as e:
-        print(f"Error extracting features for a molecule: {e}")
+        logging.error(f"Error processing molecule: {e}")
         return None
 
 def preprocess_data(csv_path, output_pkl_path):

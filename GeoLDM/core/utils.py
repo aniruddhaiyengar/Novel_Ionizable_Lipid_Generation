@@ -1,4 +1,5 @@
 import torch
+import logging
 
 
 def compute_mean_mad(dataloaders, properties, dataset_name):
@@ -53,104 +54,83 @@ def preprocess_input(one_hot, charges, charge_power, charge_scale, device):
     return atom_scalars
 
 
-def prepare_context(conditioning, minibatch, property_norms, force_unconditional=False):
+def prepare_context(conditioning, minibatch, norms):
     """
-    Prepares the context tensor for conditioning the model.
-
+    Prepare context tensor for conditioning the model.
     Args:
-        conditioning (list): List of property keys to use for conditioning.
-        minibatch (dict): Dictionary containing the batch data (must include keys
-                          in `conditioning` as well as 'positions' and 'atom_mask').
-        property_norms (dict): Dictionary containing normalization statistics
-                               (mean, mad/std) for properties in `conditioning`.
-        force_unconditional (bool): If True, ignores minibatch properties and
-                                    returns a zero context for CFG.
-
+        conditioning: List of property names to condition on
+        minibatch: Dictionary containing the batch data
+        norms: Dictionary containing normalization statistics for each property
     Returns:
-        torch.Tensor or None: The context tensor (batch_size, n_nodes, context_nf)
-                              or None if no conditioning is applied or possible.
+        Tensor of shape (batch_size, context_nf) containing normalized property values
     """
-    # Ensure basic requirements are met
-    if 'positions' not in minibatch or 'atom_mask' not in minibatch:
-         raise ValueError("'positions' and 'atom_mask' must be in minibatch")
-
-    batch_size, n_nodes, _ = minibatch['positions'].size()
-    # Ensure atom_mask has boolean type if used for masking directly
-    # Use float mask as in original model code for multiplication
-    node_mask = minibatch['atom_mask'].unsqueeze(2).float()
-
-    context_node_nf = 0
-    context_list = []
-
-    # Return None if no conditioning keys are provided
     if not conditioning:
         return None
 
-    for key in conditioning:
-        current_context = None
-        # Determine the feature dimension for this property (usually 1 for scalar global properties)
-        target_prop_nf = 1 # Default assumption for TransLNP
-
-        if force_unconditional:
-            # --- Logic for unconditional (CFG) ---
-            current_context = torch.zeros(batch_size, n_nodes, target_prop_nf,
-                                          device=minibatch['positions'].device,
-                                          dtype=minibatch['positions'].dtype)
-        else:
-            # --- Original Logic adjusted --- 
-            if key not in minibatch:
-                print(f"Warning: Conditioning key '{key}' not found in this minibatch. Skipping.")
+    # Get device from input tensor
+    device = minibatch['positions'].device
+    
+    # Initialize list to store normalized properties
+    normalized_props = []
+    
+    for prop in conditioning:
+        if prop not in minibatch:
+            logging.error(f"Property {prop} not found in minibatch. Available keys: {list(minibatch.keys())}")
+            continue
+        if prop not in norms:
+            logging.error(f"Normalization statistics for {prop} not found. Available norms: {list(norms.keys())}")
+            continue
+            
+        # Get property value and ensure it's a tensor on the correct device
+        property_value = minibatch[prop]
+        
+        # Convert to tensor if not already
+        if not isinstance(property_value, torch.Tensor):
+            try:
+                property_value = torch.tensor(property_value, device=device, dtype=torch.float32)
+            except (TypeError, ValueError) as e:
+                logging.error(f"Failed to convert property {prop} to tensor. Value: {property_value}, Type: {type(property_value)}. Error: {e}")
                 continue
-
-            properties = minibatch[key]
-
-            if key not in property_norms:
-                 raise KeyError(f"Normalization stats for key '{key}' not found in property_norms.")
-
-            norm_mean = property_norms[key]['mean']
-            norm_std = property_norms[key]['mad'] # Use 'mad' key as std dev
-
-            # Ensure mean/std are tensors and on the same device/dtype
-            if not isinstance(norm_mean, torch.Tensor): norm_mean = torch.tensor(norm_mean)
-            if not isinstance(norm_std, torch.Tensor): norm_std = torch.tensor(norm_std)
-            norm_mean = norm_mean.to(properties.device, dtype=properties.dtype)
-            norm_std = norm_std.to(properties.device, dtype=properties.dtype)
-
-            # Normalize
-            if norm_std.abs() > 1e-6:
-                properties = (properties - norm_mean) / norm_std
-            else:
-                properties = properties - norm_mean
-                # print(f"Warning: Std deviation for property '{key}' is near zero. Only applying mean centering.")
-
-            # Process based on property dimension
-            if properties.dim() == 1: # Global property (batch_size,)
-                if properties.size(0) != batch_size:
-                     raise ValueError(f"Global property '{key}' batch size mismatch.")
-                reshaped = properties.view(batch_size, 1, 1).repeat(1, n_nodes, 1)
-                current_context = reshaped
-                target_prop_nf = 1
-            # Add handling for node features if needed in the future
-            # elif properties.dim() == 2 or properties.dim() == 3:
-            #     # Node feature logic...
-            #     pass
-            else:
-                raise ValueError(f"Invalid tensor dimension {properties.dim()} for property '{key}'. Expected 1 for global.")
-
-        # Append the processed context for this key
-        if current_context is not None:
-            context_list.append(current_context)
-            context_node_nf += target_prop_nf
-
-    if not context_list:
+        else:
+            property_value = property_value.to(device, dtype=torch.float32)
+            
+        # Ensure property value has correct shape [batch_size, 1]
+        if property_value.dim() == 0:
+            property_value = property_value.view(1, 1)
+        elif property_value.dim() == 1:
+            property_value = property_value.view(-1, 1)
+            
+        # Get normalization statistics and ensure they're tensors on the correct device
+        mean = norms[prop]['mean']
+        std_dev = norms[prop]['std']
+        
+        # Convert normalization stats to tensors if needed
+        if not isinstance(mean, torch.Tensor):
+            mean = torch.tensor(mean, device=device, dtype=torch.float32)
+        else:
+            mean = mean.to(device, dtype=torch.float32)
+            
+        if not isinstance(std_dev, torch.Tensor):
+            std_dev = torch.tensor(std_dev, device=device, dtype=torch.float32)
+        else:
+            std_dev = std_dev.to(device, dtype=torch.float32)
+            
+        # Add small epsilon to prevent division by zero
+        std_dev = std_dev + 1e-6
+            
+        # Normalize property
+        normalized_prop = (property_value - mean) / std_dev
+        normalized_props.append(normalized_prop)
+    
+    if not normalized_props:
+        logging.error("No properties were successfully normalized. This should not happen with valid transfection scores.")
         return None
-
-    context = torch.cat(context_list, dim=2)
-    # Mask nodes that are padding
-    context = context * node_mask # Apply float mask via multiplication
-
-    if context.size(2) != context_node_nf:
-         raise RuntimeError(f"Final context dimension mismatch.")
-
+        
+    # Stack normalized properties along feature dimension
+    context = torch.cat(normalized_props, dim=1)
+    
+    # Ensure final context tensor is on the correct device
+    context = context.to(device, dtype=torch.float32)
+    
     return context
 

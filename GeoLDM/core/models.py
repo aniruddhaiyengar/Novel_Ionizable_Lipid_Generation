@@ -2,9 +2,11 @@ import torch
 from torch.distributions.categorical import Categorical
 
 import numpy as np
-from egnn.models import EGNN_dynamics_QM9, EGNN_encoder_QM9, EGNN_decoder_QM9
+# Use explicit relative path from GeoLDM
+from GeoLDM.egnn.models import EGNN_dynamics_QM9, EGNN_encoder_QM9, EGNN_decoder_QM9
 
-from equivariant_diffusion.en_diffusion import EnVariationalDiffusion, EnHierarchicalVAE, EnLatentDiffusion
+# Use explicit relative path from GeoLDM
+from GeoLDM.equivariant_diffusion.en_diffusion import EnVariationalDiffusion, EnHierarchicalVAE, EnLatentDiffusion
 
 import pickle
 from os.path import join
@@ -53,12 +55,21 @@ def get_model(args, device, dataset_info, dataloader_train):
 
 def get_autoencoder(args, device, dataset_info, dataloader_train):
     histogram = dataset_info['n_nodes']
-    in_node_nf = len(dataset_info['atom_decoder']) + int(args.include_charges)
+    # Original calculation:
+    # in_node_nf = len(dataset_info['atom_decoder']) + int(args.include_charges)
+    # For lipids with 6 features, and to ensure consistency:
+    # Assuming the input 'h' to the VAE has 6 features based on the runtime error.
+    effective_in_node_nf_for_vae = 16 # NEW: To match 16 features from modified lipid preprocessing
+    print(f"DEBUG: [get_autoencoder] Overriding VAE in_node_nf. Original calculation was based on dataset_info ('{dataset_info.get('name', 'unknown')}', atom_decoder len: {len(dataset_info.get('atom_decoder', []))}) and args.include_charges ({args.include_charges}). Set to: {effective_in_node_nf_for_vae}")
+
     nodes_dist = DistributionNodes(histogram)
 
     prop_dist = None
-    if len(args.conditioning) > 0:
-        prop_dist = DistributionProperty(dataloader_train, args.conditioning)
+    # Use getattr to safely access conditioning, default to empty list
+    conditioning_args = getattr(args, 'conditioning', []) 
+    # if len(args.conditioning) > 0:
+    if len(conditioning_args) > 0:
+        prop_dist = DistributionProperty(dataloader_train, conditioning_args)
 
     # if args.condition_time:
     #     dynamics_in_node_nf = in_node_nf + 1
@@ -66,35 +77,61 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
     print('Autoencoder models are _not_ conditioned on time.')
         # dynamics_in_node_nf = in_node_nf
     
+    # Use the main args.nf for the VAE's hidden dimension, unless a VAE-specific one is intended and correctly handled.
+    # The runtime error implies the loaded checkpoint's VAE encoder EGNN used hidden_nf=16.
+    # If we want to use args.nf (256), we set it here. This will likely cause weight mismatch for this layer.
+    vae_hidden_nf = args.nf 
+    print(f"DEBUG: [get_autoencoder] Using hidden_nf = {vae_hidden_nf} (from args.nf) for VAE encoder/decoder.")
+
     encoder = EGNN_encoder_QM9(
-        in_node_nf=in_node_nf, context_node_nf=args.context_node_nf, out_node_nf=args.latent_nf,
-        n_dims=3, device=device, hidden_nf=args.nf,
-        act_fn=torch.nn.SiLU(), n_layers=1,
-        attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
-        inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        include_charges=args.include_charges
+        in_node_nf=effective_in_node_nf_for_vae,  # Use modified value (6)
+        context_node_nf=args.context_node_nf, 
+        out_node_nf=args.latent_nf,
+        n_dims=3, 
+        device=device, 
+        hidden_nf=vae_hidden_nf,  # Use args.nf (e.g., 256)
+        act_fn=torch.nn.SiLU(), 
+        n_layers=args.n_layers, # Consider if VAE should have different n_layers than main model
+        attention=args.attention, 
+        tanh=args.tanh, 
+        mode=args.model, # This might need to be 'egnn_dynamics' or a VAE-specific mode if applicable
+        norm_constant=args.norm_constant,
+        inv_sublayers=args.inv_sublayers, 
+        sin_embedding=args.sin_embedding,
+        normalization_factor=args.normalization_factor, 
+        aggregation_method=args.aggregation_method,
+        include_charges=args.include_charges # This is for the EGNN_encoder_QM9 internal logic, if any
         )
     
     decoder = EGNN_decoder_QM9(
-        in_node_nf=args.latent_nf, context_node_nf=args.context_node_nf, out_node_nf=in_node_nf,
-        n_dims=3, device=device, hidden_nf=args.nf,
-        act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
-        attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
-        inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
+        in_node_nf=args.latent_nf, 
+        context_node_nf=args.context_node_nf, 
+        out_node_nf=effective_in_node_nf_for_vae, # Output should also match the 6 features
+        n_dims=3, 
+        device=device, 
+        hidden_nf=vae_hidden_nf, # Use args.nf (e.g., 256)
+        act_fn=torch.nn.SiLU(), 
+        n_layers=args.n_layers, # Consistent n_layers
+        attention=args.attention, 
+        tanh=args.tanh, 
+        mode=args.model, 
+        norm_constant=args.norm_constant,
+        inv_sublayers=args.inv_sublayers, 
+        sin_embedding=args.sin_embedding,
+        normalization_factor=args.normalization_factor, 
+        aggregation_method=args.aggregation_method,
         include_charges=args.include_charges
         )
 
     vae = EnHierarchicalVAE(
         encoder=encoder,
         decoder=decoder,
-        in_node_nf=in_node_nf,
+        in_node_nf=effective_in_node_nf_for_vae, # Pass the corrected value (6)
         n_dims=3,
         latent_node_nf=args.latent_nf,
         kl_weight=args.kl_weight,
         norm_values=args.normalize_factors,
-        include_charges=args.include_charges
+        include_charges=args.include_charges # This is for EnHierarchicalVAE internal logic
         )
 
     return vae, nodes_dist, prop_dist
@@ -103,27 +140,43 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
 def get_latent_diffusion(args, device, dataset_info, dataloader_train):
 
     # Create (and load) the first stage model (Autoencoder).
-    if args.ae_path is not None:
-        with open(join(args.ae_path, 'args.pickle'), 'rb') as f:
-            first_stage_args = pickle.load(f)
+    if args.trainable_ae:
+        print("Loading VAE model from checkpoint")
+        ae_path = getattr(args, 'ae_path', None)
+        if ae_path is not None:
+            with open(join(ae_path, 'args.pickle'), 'rb') as f:
+                ae_args = pickle.load(f)
+            first_stage_args = ae_args # Assign from loaded AE args
+        else:
+            print("Warning: trainable_ae is True, but no ae_path provided. Using main args for AE configuration.")
+            first_stage_args = args # Assign main args as fallback
     else:
-        first_stage_args = args
+        first_stage_args = args # Assign main args if not training AE
     
     # CAREFUL with this -->
+    # Ensure these common attributes exist, using defaults if necessary
     if not hasattr(first_stage_args, 'normalization_factor'):
+        print("Setting default normalization_factor=1 for AE args")
         first_stage_args.normalization_factor = 1
     if not hasattr(first_stage_args, 'aggregation_method'):
+        print("Setting default aggregation_method='sum' for AE args")
         first_stage_args.aggregation_method = 'sum'
+    # Ensure cuda attribute consistency if loaded from different setup
+    if not hasattr(first_stage_args, 'cuda'):
+         first_stage_args.cuda = args.cuda
 
-    device = torch.device("cuda" if first_stage_args.cuda else "cpu")
+    # device = torch.device("cuda" if first_stage_args.cuda else "cpu") # Use device passed into function
 
     first_stage_model, nodes_dist, prop_dist = get_autoencoder(
         first_stage_args, device, dataset_info, dataloader_train)
     first_stage_model.to(device)
 
-    if args.ae_path is not None:
+    # Safely get ae_path using getattr
+    ae_path = getattr(args, 'ae_path', None) 
+    # if args.ae_path is not None:
+    if ae_path is not None:
         fn = 'generative_model_ema.npy' if first_stage_args.ema_decay > 0 else 'generative_model.npy'
-        flow_state_dict = torch.load(join(args.ae_path, fn),
+        flow_state_dict = torch.load(join(ae_path, fn),
                                         map_location=device)
         first_stage_model.load_state_dict(flow_state_dict)
 
@@ -131,7 +184,10 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
     args.latent_nf = first_stage_args.latent_nf
     in_node_nf = args.latent_nf
 
-    if args.condition_time:
+    # Use getattr to safely access condition_time, default to False
+    condition_time = getattr(args, 'condition_time', False)
+    # if args.condition_time:
+    if condition_time:
         dynamics_in_node_nf = in_node_nf + 1
     else:
         print('Warning: dynamics model is _not_ conditioned on time.')
@@ -145,7 +201,9 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method)
 
-    if args.probabilistic_model == 'diffusion':
+    # Use getattr to safely access probabilistic_model, default to 'diffusion'
+    probabilistic_model = getattr(args, 'probabilistic_model', 'diffusion')
+    if probabilistic_model == 'diffusion':
         vdm = EnLatentDiffusion(
             vae=first_stage_model,
             trainable_ae=args.trainable_ae,
@@ -163,14 +221,14 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
         return vdm, nodes_dist, prop_dist
 
     else:
-        raise ValueError(args.probabilistic_model)
+        raise ValueError(f"Unknown probabilistic_model: {probabilistic_model}")
 
 
-def get_optim(args, generative_model):
+def get_optim(args, generative_model, weight_decay=1e-12):
     optim = torch.optim.AdamW(
         generative_model.parameters(),
         lr=args.lr, amsgrad=True,
-        weight_decay=1e-12)
+        weight_decay=weight_decay)
 
     return optim
 

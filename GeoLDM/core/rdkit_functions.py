@@ -3,7 +3,7 @@ import numpy as np
 from GeoLDM.core.bond_analyze import get_bond_order, geom_predictor
 from . import dataset
 import torch
-from configs.datasets_config import get_dataset_info
+from GeoLDM.configs.datasets_config import get_dataset_info
 import pickle
 import os
 
@@ -173,18 +173,45 @@ def build_xae_molecule(positions, atom_types, dataset_info):
 
     pos = positions.unsqueeze(0)
     dists = torch.cdist(pos, pos, p=2).squeeze(0)
-    for i in range(n):
-        for j in range(i):
-            pair = sorted([atom_types[i], atom_types[j]])
-            if dataset_info['name'] == 'qm9' or dataset_info['name'] == 'qm9_second_half' or dataset_info['name'] == 'qm9_first_half':
-                order = get_bond_order(atom_decoder[pair[0]], atom_decoder[pair[1]], dists[i, j])
-            elif dataset_info['name'] == 'geom':
-                order = geom_predictor((atom_decoder[pair[0]], atom_decoder[pair[1]]), dists[i, j], limit_bonds_to_one=True)
-            # TODO: a batched version of get_bond_order to avoid the for loop
-            if order > 0:
-                # Warning: the graph should be DIRECTED
-                A[i, j] = 1
-                E[i, j] = order
+    
+    # Create matrices of atom types for each pair
+    atom_types_i = atom_types.unsqueeze(1).expand(n, n)
+    atom_types_j = atom_types.unsqueeze(0).expand(n, n)
+    
+    # Get the lower triangular indices
+    tril_indices = torch.tril_indices(n, n, offset=-1)
+    
+    # Get atom type pairs for lower triangle
+    atom_pairs_i = atom_types_i[tril_indices[0], tril_indices[1]]
+    atom_pairs_j = atom_types_j[tril_indices[0], tril_indices[1]]
+    
+    # Get distances for lower triangle
+    dists_tril = dists[tril_indices[0], tril_indices[1]]
+    
+    # Sort atom pairs for consistent ordering
+    atom_pairs = torch.stack([torch.minimum(atom_pairs_i, atom_pairs_j), 
+                            torch.maximum(atom_pairs_i, atom_pairs_j)], dim=1)
+    
+    # Get bond orders for all pairs at once
+    if dataset_info['name'] in ['qm9', 'qm9_second_half', 'qm9_first_half']:
+        orders = torch.tensor([get_bond_order(atom_decoder[pair[0].item()], 
+                                            atom_decoder[pair[1].item()], 
+                                            dist.item()) 
+                             for pair, dist in zip(atom_pairs, dists_tril)])
+    elif dataset_info['name'] == 'geom':
+        orders = torch.tensor([geom_predictor((atom_decoder[pair[0].item()], 
+                                             atom_decoder[pair[1].item()]), 
+                                            dist.item(), 
+                                            limit_bonds_to_one=True) 
+                             for pair, dist in zip(atom_pairs, dists_tril)])
+    
+    # Set bond orders in the lower triangle
+    E[tril_indices[0], tril_indices[1]] = orders
+    # Set bond orders in the upper triangle (symmetric)
+    E[tril_indices[1], tril_indices[0]] = orders
+    # Set adjacency matrix based on bond orders
+    A = E.bool()
+    
     return X, A, E
 
 if __name__ == '__main__':

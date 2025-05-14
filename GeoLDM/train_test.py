@@ -1,13 +1,13 @@
 import wandb
-from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
+from GeoLDM.equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked, sample_center_gravity_zero_gaussian_with_mask
 import numpy as np
-import core.visualizer as vis
-from core.analyze import analyze_stability_for_molecules
-from core.sampling import sample_chain, sample, sample_sweep_conditional
-import utils
-import core.utils as core_utils
-from core import losses
+from GeoLDM.core import visualizer as vis
+from GeoLDM.core.analyze import analyze_stability_for_molecules
+from GeoLDM.core.sampling import sample_chain, sample, sample_sweep_conditional
+import GeoLDM.utils as utils
+import GeoLDM.core.utils as core_utils
+from GeoLDM.core import losses
 import time
 import torch
 

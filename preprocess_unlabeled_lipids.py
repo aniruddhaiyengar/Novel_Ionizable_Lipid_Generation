@@ -13,7 +13,8 @@ PROCESSED_UNLABELED_PKL = os.path.join(OUTPUT_DIR, "processed_unlabeled_lipids.p
 MAX_MOLECULES_TO_PROCESS = 10000  # Stop after processing this many molecules
 
 # Define the atom types expected in the dataset (ensure consistency with other scripts)
-ATOM_DECODER = ['H', 'C', 'N', 'O', 'P']
+# Match exactly with the model's atom decoder
+ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
 NUM_ATOM_TYPES = len(ATOM_DECODER)
 
@@ -21,15 +22,16 @@ NUM_ATOM_TYPES = len(ATOM_DECODER)
 
 def generate_conformer_from_mol(mol):
     """
-    Adds hydrogens, generates a 3D conformer, optimizes, and computes Gasteiger charges
+    Generates a 3D conformer, optimizes, and computes Gasteiger charges
     for a given RDKit molecule object (potentially read from SDF).
     Tries fallback methods if ETKDG fails.
+    Note: Does not add hydrogens as we're working with molecules without hydrogens.
 
     Args:
         mol (rdkit.Chem.Mol): The RDKit molecule object.
 
     Returns:
-        rdkit.Chem.Mol or None: The RDKit molecule object with added Hs, 3D conformer, and charges,
+        rdkit.Chem.Mol or None: The RDKit molecule object with 3D conformer and charges,
                                 or None if processing fails.
     """
     try:
@@ -39,8 +41,7 @@ def generate_conformer_from_mol(mol):
         # Get name for logging if available
         mol_name = mol.GetProp("_Name") if mol.HasProp("_Name") else "unknown_molecule"
 
-        # Add hydrogens (important for accurate charges and geometry)
-        mol = Chem.AddHs(mol, addCoords=True) # addCoords helps if input had some 3D info
+        # Note: We don't add hydrogens here since we're working with molecules without hydrogens
 
         conf_id = -1
         # Try using existing conformer first if available from SDF
@@ -125,9 +126,16 @@ def process_molecule(mol):
         positions = conformer.GetPositions() # Get atom coordinates (NumAtoms x 3)
 
         num_atoms = mol.GetNumAtoms()
-        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES))
-        charges = np.zeros((num_atoms, 1))
-        atom_mask = np.ones((num_atoms, 1)) # Mask indicating which atoms are real
+        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32) # Will be (num_atoms, 16)
+        # charges = np.zeros((num_atoms, 1)) # Original: Gasteiger charge as 1 feature
+        
+        # To match GEOM's include_charges=False behavior where charges don't add to feature dim:
+        # We'll still calculate Gasteiger for potential future use or inspection,
+        # but the 'charges' field in the output dict will be 0-dimensional.
+        actual_gasteiger_charges = np.zeros((num_atoms, 1), dtype=np.float32) 
+        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dimensional feature
+
+        atom_mask = np.ones((num_atoms, 1), dtype=np.float32) # Mask indicating which atoms are real
 
         # Extract atom features
         valid_molecule = True
@@ -149,7 +157,8 @@ def process_molecule(mol):
 
             # Get Gasteiger charge
             charge = atom.GetDoubleProp('_GasteigerCharge') if atom.HasProp('_GasteigerCharge') else 0.0
-            charges[i, 0] = charge
+            # charges[i, 0] = charge # Store in original charges array
+            actual_gasteiger_charges[i, 0] = charge # Store calculated Gasteiger charge separately
 
         if not valid_molecule:
             return None
@@ -157,10 +166,13 @@ def process_molecule(mol):
         # Prepare data dictionary
         data = {
             'positions': positions.astype(np.float32),
-            'one_hot': one_hot.astype(np.float32),
-            'charges': charges.astype(np.float32),
+            'one_hot': one_hot.astype(np.float32), # This is (N, 16)
+            # 'charges': charges.astype(np.float32), # Original
+            'charges': output_charges_feature, # This is (N, 0)
             'atom_mask': atom_mask.astype(np.float32)
             # No conditioning key needed here
+            # Optionally, we could store the actual Gasteiger charges under a different key if needed for analysis
+            # 'gasteiger_charges_raw': actual_gasteiger_charges 
         }
         return data
     except AttributeError:

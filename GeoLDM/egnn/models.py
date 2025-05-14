@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from egnn.egnn_new import EGNN, GNN
-from equivariant_diffusion.utils import remove_mean, remove_mean_with_mask
+from GeoLDM.egnn.egnn_new import EGNN, GNN
+from GeoLDM.equivariant_diffusion.utils import remove_mean, remove_mean_with_mask
 import numpy as np
 
 
@@ -14,8 +14,14 @@ class EGNN_dynamics_QM9(nn.Module):
         super().__init__()
         self.mode = mode
         if mode == 'egnn_dynamics':
+            # Calculate effective input node features for the EGNN core
+            effective_in_node_nf_for_core_egnn = in_node_nf + context_node_nf
+            if condition_time:
+                effective_in_node_nf_for_core_egnn += 1
+
             self.egnn = EGNN(
-                in_node_nf=in_node_nf + context_node_nf, in_edge_nf=1,
+                in_node_nf=effective_in_node_nf_for_core_egnn,
+                in_edge_nf=1,
                 hidden_nf=hidden_nf, device=device, act_fn=act_fn,
                 n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                 inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
@@ -23,8 +29,10 @@ class EGNN_dynamics_QM9(nn.Module):
                 aggregation_method=aggregation_method)
             self.in_node_nf = in_node_nf
         elif mode == 'gnn_dynamics':
+            effective_in_node_nf_for_gnn = in_node_nf + context_node_nf + 3
             self.gnn = GNN(
-                in_node_nf=in_node_nf + context_node_nf + 3, in_edge_nf=0,
+                in_node_nf=effective_in_node_nf_for_gnn, 
+                in_edge_nf=0,
                 hidden_nf=hidden_nf, out_node_nf=3 + in_node_nf, device=device,
                 act_fn=act_fn, n_layers=n_layers, attention=attention,
                 normalization_factor=normalization_factor, aggregation_method=aggregation_method)
@@ -51,9 +59,13 @@ class EGNN_dynamics_QM9(nn.Module):
         h_dims = dims - self.n_dims
         edges = self.get_adj_matrix(n_nodes, bs, self.device)
         edges = [x.to(self.device) for x in edges]
+        
+        # Reshape masks and input
         node_mask = node_mask.view(bs*n_nodes, 1)
         edge_mask = edge_mask.view(bs*n_nodes*n_nodes, 1)
         xh = xh.view(bs*n_nodes, -1).clone() * node_mask
+        
+        # Split x and h
         x = xh[:, 0:self.n_dims].clone()
         if h_dims == 0:
             h = torch.ones(bs*n_nodes, 1).to(self.device)
@@ -62,40 +74,39 @@ class EGNN_dynamics_QM9(nn.Module):
 
         if self.condition_time:
             if np.prod(t.size()) == 1:
-                # t is the same for all elements in batch.
                 h_time = torch.empty_like(h[:, 0:1]).fill_(t.item())
             else:
-                # t is different over the batch dimension.
-                h_time = t.view(bs, 1).repeat(1, n_nodes)
-                h_time = h_time.view(bs * n_nodes, 1)
+                h_time = t.view(bs, 1).repeat(1, n_nodes).view(bs * n_nodes, 1)
             h = torch.cat([h, h_time], dim=1)
 
         if context is not None:
-            # We're conditioning, awesome!
-            context = context.view(bs*n_nodes, self.context_node_nf)
+            context = context.repeat_interleave(n_nodes, dim=0)
+            context = context.to(h.device)
             h = torch.cat([h, context], dim=1)
 
         if self.mode == 'egnn_dynamics':
             h_final, x_final = self.egnn(h, x, edges, node_mask=node_mask, edge_mask=edge_mask)
-            vel = (x_final - x) * node_mask  # This masking operation is redundant but just in case
+            
+            # Reshape outputs back to batch form
+            h_final = h_final.view(bs, n_nodes, -1)
+            x_final = x_final.view(bs, n_nodes, -1)
+            
+            # Calculate velocity
+            vel = (x_final - x.view(bs, n_nodes, -1)) * node_mask.view(bs, n_nodes, 1)
+            
         elif self.mode == 'gnn_dynamics':
             xh = torch.cat([x, h], dim=1)
             output = self.gnn(xh, edges, node_mask=node_mask)
-            vel = output[:, 0:3] * node_mask
-            h_final = output[:, 3:]
-
+            vel = output[:, 0:3].view(bs, n_nodes, -1) * node_mask.view(bs, n_nodes, 1)
+            h_final = output[:, 3:].view(bs, n_nodes, -1)
         else:
             raise Exception("Wrong mode %s" % self.mode)
 
         if context is not None:
-            # Slice off context size:
-            h_final = h_final[:, :-self.context_node_nf]
+            h_final = h_final[:, :, :-self.context_node_nf]
 
         if self.condition_time:
-            # Slice off last dimension which represented time.
-            h_final = h_final[:, :-1]
-
-        vel = vel.view(bs, n_nodes, -1)
+            h_final = h_final[:, :, :-1]
 
         if torch.any(torch.isnan(vel)):
             print('Warning: detected nan, resetting EGNN output to zero.')
@@ -109,7 +120,6 @@ class EGNN_dynamics_QM9(nn.Module):
         if h_dims == 0:
             return vel
         else:
-            h_final = h_final.view(bs, n_nodes, -1)
             return torch.cat([vel, h_final], dim=2)
 
     def get_adj_matrix(self, n_nodes, batch_size, device):
@@ -206,8 +216,11 @@ class EGNN_encoder_QM9(nn.Module):
             h = xh[:, self.n_dims:].clone()
 
         if context is not None:
-            # We're conditioning, awesome!
-            context = context.view(bs*n_nodes, self.context_node_nf)
+            # Expand molecule-level context to node-level
+            # context shape: (batch_size, context_nf) -> (batch_size * n_nodes, context_nf)
+            context = context.repeat_interleave(n_nodes, dim=0)
+            # Ensure context is on the same device as h
+            context = context.to(h.device)
             h = torch.cat([h, context], dim=1)
 
         if self.mode == 'egnn_dynamics':
@@ -347,8 +360,11 @@ class EGNN_decoder_QM9(nn.Module):
             h = xh[:, self.n_dims:].clone()
 
         if context is not None:
-            # We're conditioning, awesome!
-            context = context.view(bs*n_nodes, self.context_node_nf)
+            # Expand molecule-level context to node-level
+            # context shape: (batch_size, context_nf) -> (batch_size * n_nodes, context_nf)
+            context = context.repeat_interleave(n_nodes, dim=0)
+            # Ensure context is on the same device as h
+            context = context.to(h.device)
             h = torch.cat([h, context], dim=1)
 
         if self.mode == 'egnn_dynamics':

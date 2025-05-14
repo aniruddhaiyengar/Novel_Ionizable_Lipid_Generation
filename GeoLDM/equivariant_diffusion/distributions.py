@@ -1,11 +1,13 @@
 import torch
-from equivariant_diffusion.utils import \
+from GeoLDM.equivariant_diffusion.utils import \
     center_gravity_zero_gaussian_log_likelihood_with_mask, \
     standard_gaussian_log_likelihood_with_mask, \
     center_gravity_zero_gaussian_log_likelihood, \
     sample_center_gravity_zero_gaussian_with_mask, \
     sample_center_gravity_zero_gaussian, \
-    sample_gaussian_with_mask
+    sample_gaussian_with_mask, \
+    assert_mean_zero_with_mask, remove_mean_with_mask, \
+    assert_correctly_masked
 
 
 class PositionFeaturePrior(torch.nn.Module):

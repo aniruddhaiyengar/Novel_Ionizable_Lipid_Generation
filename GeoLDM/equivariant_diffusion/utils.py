@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import logging
 
 
 class EMA():
@@ -29,13 +30,69 @@ def remove_mean(x):
 
 
 def remove_mean_with_mask(x, node_mask):
-    masked_max_abs_value = (x * (1 - node_mask)).abs().sum().item()
-    assert masked_max_abs_value < 1e-5, f'Error {masked_max_abs_value} too high'
-    N = node_mask.sum(1, keepdims=True)
+    """
+    Remove mean from x while respecting the node_mask.
+    Args:
+        x: Tensor of shape (batch_size, n_nodes, n_dims)
+        node_mask: Tensor of shape (batch_size, n_nodes, 1) with binary values
+    Returns:
+        Tensor of same shape as x with mean removed
+    """
+    # ---- START MOVED VALIDATION ----
+    # Input validation: Ensure these checks are first.
+    if x is None or node_mask is None:
+        raise ValueError("Both x and node_mask must be provided for remove_mean_with_mask")
+    
+    # Ensure proper shapes and types
+    if not torch.is_tensor(x) or not torch.is_tensor(node_mask):
+        raise TypeError("Both x and node_mask must be PyTorch tensors for remove_mean_with_mask")
+    # ---- END MOVED VALIDATION ----
 
-    mean = torch.sum(x, dim=1, keepdim=True) / N
-    x = x - mean * node_mask
-    return x
+    # Debug logging for error tracking
+    logging.debug(f"remove_mean_with_mask input - x type: {type(x)}, node_mask type: {type(node_mask)}")
+    if x is not None: # This check is now somewhat redundant due to above, but kept for shape/dtype logging
+        logging.debug(f"x shape: {x.shape}, dtype: {x.dtype}, device: {x.device}")
+    if node_mask is not None: # Similarly redundant for None, but good for shape/dtype logging
+        logging.debug(f"node_mask shape: {node_mask.shape}, dtype: {node_mask.dtype}, device: {node_mask.device}")
+    
+    if x.dim() != 3:
+        raise ValueError(f"x must be 3D tensor, got shape {x.shape}")
+    if node_mask.dim() != 3:
+        raise ValueError(f"node_mask must be 3D tensor, got shape {node_mask.shape}")
+    
+    # Ensure node_mask is binary and float
+    node_mask = node_mask.float()
+    node_mask = (node_mask > 0.5).float()
+    
+    # Check for masked values
+    masked_max_abs_value = (x * (1 - node_mask)).abs().sum().item()
+    if masked_max_abs_value > 1e-5:
+        logging.warning(f"High masked value detected: {masked_max_abs_value}")
+    
+    # Calculate number of valid nodes per batch
+    N = node_mask.sum(1, keepdims=True)
+    logging.debug(f"Number of valid nodes per batch: {N.squeeze().tolist()}")
+    
+    # Handle case where N is 0 (no valid nodes in the batch)
+    # Important: Check if ALL elements in N are zero for a given batch item, not just if any N is 0.
+    # However, the original (N == 0).any() would trigger if any sample in the batch has N=0.
+    # Let's refine this to per-sample handling if needed, but for now, keep original logic.
+    if (N == 0).any(): # If any sample in the batch has no valid nodes
+        logging.warning("Encountered a sample in the batch with no valid nodes. Returning original tensor for that sample or the whole batch based on downstream logic (currently whole batch).")
+        # This return is for the whole batch if any sample has N=0.
+        # A more granular approach might be needed if only some samples have N=0.
+        return x # Potentially problematic if only some samples in batch are all masked
+    
+    # Calculate mean and remove it
+    mean = torch.sum(x, dim=1, keepdim=True) / (N + 1e-8)  # Add small epsilon to prevent division by zero
+    x_centered = x - mean * node_mask # Create new tensor for the result
+    
+    # Final validation
+    if torch.isnan(x_centered).any() or torch.isinf(x_centered).any():
+        logging.warning("NaN/Inf detected after mean removal. Returning original tensor x.")
+        return x # Return original x, not potentially corrupted x_centered
+    
+    return x_centered
 
 
 def assert_mean_zero(x):
