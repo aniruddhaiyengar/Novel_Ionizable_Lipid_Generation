@@ -1,6 +1,6 @@
 *.pt
 *.sdf
-/data/structures.sdf
+/data
 /wandb/
 # Python specific
 __pycache__/
