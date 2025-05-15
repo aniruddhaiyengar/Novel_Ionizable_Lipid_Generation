@@ -8,7 +8,7 @@ import argparse
 from core import dataset
 from core.models import get_model, get_autoencoder, get_latent_diffusion
 import os
-from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
+from GeoLDM.equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked
 import torch
 import time
@@ -20,6 +20,7 @@ from core.analyze import analyze_stability_for_molecules, analyze_node_distribut
 from core.utils import prepare_context, compute_mean_mad
 from core import visualizer as core_visualizer
 import core.losses as losses
+import wandb
 
 try:
     from core import rdkit_functions

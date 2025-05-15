@@ -39,6 +39,132 @@ from pathlib import Path
 from collections import Counter
 import math # Added for math.sqrt
 
+# --- LSUV Global and Helper Functions (NEW - PLACED AT TOP) ---
+captured_output_lsuv = None
+
+def hook_fn_lsuv(module, input, output):
+    global captured_output_lsuv
+    captured_output_lsuv = output
+
+def get_layer_by_path(model, path_str):
+    obj = model
+    for part in path_str.split('.'):
+        if hasattr(obj, part):
+            obj = getattr(obj, part)
+        elif part.isdigit() and isinstance(obj, (torch.nn.ModuleList, torch.nn.Sequential)):
+            try:
+                obj = obj[int(part)]
+            except IndexError:
+                logging.error(f"IndexError getting layer part {part} in {path_str}")
+                return None
+        else:
+            logging.error(f"Could not get layer part {part} in {path_str}")
+            return None
+    return obj
+
+def lsuv_initialize_modules(model, module_paths, sample_batch_data, args_obj, device, dtype,
+                           target_std=0.05, target_mean=0.0, iterations=10, tolerance=0.01,
+                           is_stage2_run=False):
+    logging.info(f"Starting LSUV init for {len(module_paths)} modules (is_stage2_run: {is_stage2_run}), target_std={target_std}, target_mean={target_mean}")
+    global captured_output_lsuv
+
+    # Get all suitable modules for LSUV initialization
+    modules = get_lsuv_modules(model, module_paths)
+    logging.info(f"Found {len(modules)} suitable modules for LSUV initialization")
+
+    # Initialize max deviation variables
+    max_mean_deviation_from_target = 0.0
+    max_std_deviation_from_target = 0.0
+
+    # --- Prepare sample batch data (x, h) ---
+    x_sample_raw = sample_batch_data['positions'].to(device, dtype)
+    one_hot_sample_raw = sample_batch_data['one_hot'].to(device, dtype)
+    charges_sample_raw = sample_batch_data['charges'].to(device, dtype)
+    node_mask_sample = sample_batch_data['atom_mask'].to(device, dtype)
+    edge_mask_sample = sample_batch_data['edge_mask'].to(device, dtype)
+
+    if node_mask_sample.ndim == 2:
+        node_mask_sample = node_mask_sample.unsqueeze(-1)
+
+    x_mean_attr = 'stage2_dataset_x_mean' if is_stage2_run else 'dataset_x_mean'
+    x_std_attr = 'stage2_dataset_x_std' if is_stage2_run else 'dataset_x_std'
+    h_cat_mean_attr = 'stage2_dataset_h_cat_mean' if is_stage2_run else 'dataset_h_cat_mean'
+    h_cat_std_attr = 'stage2_dataset_h_cat_std' if is_stage2_run else 'dataset_h_cat_std'
+
+    # Initialize normalized tensors
+    x_sample_normalized = x_sample_raw
+    one_hot_sample_normalized = one_hot_sample_raw
+
+    # Apply normalization if stats are available
+    if hasattr(args_obj, x_mean_attr) and getattr(args_obj, x_mean_attr) is not None:
+        dataset_x_mean_dev = getattr(args_obj, x_mean_attr).to(device)
+        dataset_x_std_dev = getattr(args_obj, x_std_attr).to(device)
+        x_sample_normalized = (x_sample_raw - dataset_x_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_x_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
+    else:
+        logging.warning(f"LSUV: Dataset x mean/std not found in args_obj ({x_mean_attr}). Using raw positions.")
+
+    if hasattr(args_obj, h_cat_mean_attr) and getattr(args_obj, h_cat_mean_attr) is not None:
+        dataset_h_cat_mean_dev = getattr(args_obj, h_cat_mean_attr).to(device)
+        dataset_h_cat_std_dev = getattr(args_obj, h_cat_std_attr).to(device)
+        one_hot_sample_normalized = (one_hot_sample_raw - dataset_h_cat_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_h_cat_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
+    else:
+        logging.warning(f"LSUV: Dataset h_cat mean/std not found in args_obj ({h_cat_mean_attr}). Using raw one_hot features.")
+
+    x_sample_for_model = diffusion_utils.remove_mean_with_mask(x_sample_normalized, node_mask_sample)
+    one_hot_sample_for_model = one_hot_sample_normalized * node_mask_sample
+    charges_sample_for_model = charges_sample_raw * node_mask_sample
+    h_sample_for_model = {'categorical': one_hot_sample_for_model, 'integer': charges_sample_for_model}
+
+    # Ensure model's gamma tensor is on the correct device
+    if hasattr(model, 'gamma'):
+        model.gamma = model.gamma.to(device)
+    if hasattr(model, 'dynamics') and hasattr(model.dynamics, 'gamma'):
+        model.dynamics.gamma = model.dynamics.gamma.to(device)
+
+    original_training_state = model.training
+    model.eval()
+
+    for iteration in range(iterations):
+        logging.info(f"  LSUV Iteration {iteration + 1}/{iterations}")
+        iteration_max_std_dev = 0.0
+        iteration_max_mean_dev = 0.0
+        
+        for path, module in modules:
+            if not isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                continue
+
+            handle = module.register_forward_hook(hook_fn_lsuv)
+            with torch.no_grad():
+                _ = model(x_sample_for_model, h_sample_for_model, node_mask_sample, edge_mask_sample, context=None)
+            handle.remove()
+
+            if captured_output_lsuv is not None:
+                adjusted_activations = captured_output_lsuv.detach()
+                captured_output_lsuv = None
+                
+                # Apply masking to adjusted activations if they have the same shape as node_mask
+                if adjusted_activations.shape[:2] == node_mask_sample.shape[:2]:
+                    adjusted_activations = adjusted_activations * node_mask_sample
+                
+                finite_adjusted = adjusted_activations[torch.isfinite(adjusted_activations)]
+                if finite_adjusted.numel() > 0:
+                    mean_after_adjust = finite_adjusted.mean()
+                    std_after_adjust = finite_adjusted.std()
+                    iteration_max_mean_dev = max(iteration_max_mean_dev, abs(mean_after_adjust.item() - target_mean))
+                    iteration_max_std_dev = max(iteration_max_std_dev, abs(std_after_adjust.item() - target_std))
+
+        max_mean_deviation_from_target = iteration_max_mean_dev
+        max_std_deviation_from_target = iteration_max_std_dev
+        
+        logging.info(f"  LSUV Iteration {iteration + 1} ended. Max mean_dev ~ {max_mean_deviation_from_target:.4f}, Max std_dev_from_target={max_std_deviation_from_target:.4f}")
+        if max_std_deviation_from_target < tolerance and max_mean_deviation_from_target < tolerance:
+            logging.info(f"  LSUV converged after {iteration + 1} iterations.")
+            break
+            
+    model.train(original_training_state)
+    logging.info("LSUV-like initialization finished.")
+# --- End of LSUV Global and Helper Functions ---
+
 # --- Argument Parsing Setup ---
 # Define parser first
 parser = argparse.ArgumentParser(description='GeoLDM Lipid Adaptation (Stage 1 - Unlabeled)')
@@ -335,6 +461,82 @@ except Exception as e_hist:
     exit(1)
 # --- End of n_nodes histogram calculation ---
 
+# --- Compute Dataset Statistics for Normalization (NEW) ---
+logging.info("Calculating dataset statistics for normalization...")
+all_positions_list = []
+all_one_hot_list = []
+# Iterate through the dataset directly to avoid shuffling and batching artifacts for stats
+temp_dataset_for_stats = dataloaders['train'].dataset
+if not temp_dataset_for_stats or len(temp_dataset_for_stats) == 0: # Check if dataset has items
+    logging.error("Training dataset is empty or has no length, cannot compute normalization stats. Exiting.")
+    exit(1)
+
+for i in range(len(temp_dataset_for_stats)):
+    sample_data = temp_dataset_for_stats[i] # This is a dict of numpy arrays
+    
+    if not all(k in sample_data for k in ['positions', 'one_hot', 'atom_mask']):
+        logging.warning(f"Skipping sample {i} for stats calculation due to missing keys.")
+        continue
+        
+    pos = sample_data['positions']      # (N, 3)
+    one_hot = sample_data['one_hot']    # (N, num_feat_one_hot)
+    atom_mask = sample_data['atom_mask']# (N, 1)
+    
+    valid_indices = atom_mask.squeeze().astype(bool)
+    
+    if np.any(valid_indices): # Ensure there are valid atoms before trying to index
+        masked_pos = pos[valid_indices]
+        masked_one_hot = one_hot[valid_indices]
+    
+        # NEW: Check for NaNs/infs in masked_pos before appending
+        if masked_pos.size > 0:
+            if np.isnan(masked_pos).any() or np.isinf(masked_pos).any():
+                logging.warning(f"Sample {i} position data (after masking) contains NaN/inf. Skipping for position stats.")
+            else:
+                all_positions_list.append(masked_pos)
+        
+        # NEW: Check for NaNs/infs in masked_one_hot before appending
+        if masked_one_hot.size > 0:
+            if np.isnan(masked_one_hot).any() or np.isinf(masked_one_hot).any():
+                logging.warning(f"Sample {i} one_hot data (after masking) contains NaN/inf. Skipping for one_hot stats.")
+            else:
+                all_one_hot_list.append(masked_one_hot)
+    else:
+        logging.warning(f"Sample {i} has no valid atoms based on atom_mask. Skipping for stats.")
+
+
+if not all_positions_list or not all_one_hot_list:
+    logging.error("No valid data found after masking (or all samples had no valid atoms) to compute normalization stats. Check dataset. Exiting")
+    exit(1)
+
+# Concatenate and convert to tensors
+all_positions_np = np.concatenate(all_positions_list, axis=0)
+all_one_hot_np = np.concatenate(all_one_hot_list, axis=0)
+
+all_positions_tensor = torch.from_numpy(all_positions_np).float()
+all_one_hot_tensor = torch.from_numpy(all_one_hot_np).float()
+
+# Calculate stats for positions
+args.dataset_x_mean = torch.mean(all_positions_tensor, dim=0) 
+args.dataset_x_std = torch.std(all_positions_tensor, dim=0)
+args.dataset_x_std[args.dataset_x_std < 1e-6] = 1.0 # Avoid division by zero
+
+# Calculate stats for one-hot features
+args.dataset_h_cat_mean = torch.mean(all_one_hot_tensor, dim=0)
+args.dataset_h_cat_std = torch.std(all_one_hot_tensor, dim=0)
+args.dataset_h_cat_std[args.dataset_h_cat_std < 1e-6] = 1.0
+
+logging.info(f"  Dataset x_mean: {args.dataset_x_mean.tolist()}")
+logging.info(f"  Dataset x_std: {args.dataset_x_std.tolist()}")
+logging.info(f"  Dataset h_cat_mean: {args.dataset_h_cat_mean.tolist()}")
+logging.info(f"  Dataset h_cat_std: {args.dataset_h_cat_std.tolist()}")
+
+original_normalize_factors = args.normalize_factors
+args.normalize_factors = [1.0, 1.0, 1.0] # Make internal normalization an identity op
+logging.info(f"Original args.normalize_factors were {original_normalize_factors}. Set to {args.normalize_factors} for external normalization.")
+# --- End of Dataset Statistics for Normalization ---
+
+
 # --- Set Unconditional Context ---
 args.context_node_nf = 0 # Unconditional for Stage 1
 logging.info(f"Running Stage 1 Adaptation (Unconditional): context_node_nf = {args.context_node_nf}")
@@ -347,128 +549,241 @@ logging.info(f"Instantiating model (train_diffusion={args.train_diffusion})...")
 model, nodes_dist, prop_dist = get_latent_diffusion(args, device, dataset_info, dataloaders['train'])
 logging.info("Model instantiated.")
 
-# --- Custom Initialization for Problematic Layers (NEW) ---
+# --- Custom Initialization for Problematic Layers (called BEFORE pretrained loading) ---
 def initialize_problematic_layers(model_to_init, args_for_init):
-    logging.info("Applying custom initialization to specific layers with changed sizes...")
+    # This function should use normal_(mean=0.0, std=0.01) as per previous step
+    logging.info("Applying custom CONSERVATIVE initialization (normal std=0.01) to specific layers with changed sizes (BEFORE LSUV)...")
     try:
         # 1. dynamics.egnn.embedding
         if hasattr(model_to_init, 'dynamics') and hasattr(model_to_init.dynamics, 'egnn') and hasattr(model_to_init.dynamics.egnn, 'embedding'):
             layer = model_to_init.dynamics.egnn.embedding
             if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.kaiming_normal_(layer.weight, a=math.sqrt(5)) # Kaiming normal for SiLU
+                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01) 
                 if layer.bias is not None:
                     torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.dynamics.egnn.embedding")
-            else:
-                logging.warning("  model.dynamics.egnn.embedding is not nn.Linear")
-        else:
-            logging.warning("  Could not find model.dynamics.egnn.embedding for custom init.")
-
+                logging.info("  Initialized model.dynamics.egnn.embedding with normal_(std=0.01)")
+        # ... (repeat for other 3 layers: dynamics.egnn.embedding_out, vae.encoder.final_mlp[2], vae.decoder.egnn.embedding) ...
+        # Ensure all 4 layers from previous edits are covered here with normal_(0,0.01)
         # 2. dynamics.egnn.embedding_out
         if hasattr(model_to_init, 'dynamics') and hasattr(model_to_init.dynamics, 'egnn') and hasattr(model_to_init.dynamics.egnn, 'embedding_out'):
             layer = model_to_init.dynamics.egnn.embedding_out
             if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.kaiming_normal_(layer.weight, a=math.sqrt(5))
+                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
                 if layer.bias is not None:
                     torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.dynamics.egnn.embedding_out")
-            else:
-                logging.warning("  model.dynamics.egnn.embedding_out is not nn.Linear")
-        else:
-            logging.warning("  Could not find model.dynamics.egnn.embedding_out for custom init.")
+                logging.info("  Initialized model.dynamics.egnn.embedding_out with normal_(std=0.01)")
 
         # 3. vae.encoder.final_mlp[2]
-        if hasattr(model_to_init, 'vae') and hasattr(model_to_init.vae, 'encoder') and hasattr(model_to_init.vae.encoder, 'final_mlp') and len(model_to_init.vae.encoder.final_mlp) > 2:
-            layer = model_to_init.vae.encoder.final_mlp[2]
+        # Note: Accessing final_mlp[2] needs care if model structure changes.
+        # This path should be verified.
+        final_mlp_module = get_layer_by_path(model_to_init, "vae.encoder.final_mlp")
+        if final_mlp_module and isinstance(final_mlp_module, torch.nn.Sequential) and len(final_mlp_module) > 2:
+            layer = final_mlp_module[2]
             if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.kaiming_normal_(layer.weight, a=math.sqrt(5))
+                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
                 if layer.bias is not None:
                     torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.vae.encoder.final_mlp[2]")
+                logging.info("  Initialized model.vae.encoder.final_mlp[2] with normal_(std=0.01)")
             else:
-                logging.warning("  model.vae.encoder.final_mlp[2] is not nn.Linear")
+                logging.warning("  model.vae.encoder.final_mlp[2] found but not nn.Linear")
         else:
-            logging.warning("  Could not find model.vae.encoder.final_mlp[2] for custom init.")
-
+            logging.warning("  Could not find or access model.vae.encoder.final_mlp[2] for conservative init.")
+            
         # 4. vae.decoder.egnn.embedding
         if hasattr(model_to_init, 'vae') and hasattr(model_to_init.vae, 'decoder') and hasattr(model_to_init.vae.decoder, 'egnn') and hasattr(model_to_init.vae.decoder.egnn, 'embedding'):
             layer = model_to_init.vae.decoder.egnn.embedding
             if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.kaiming_normal_(layer.weight, a=math.sqrt(5))
+                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
                 if layer.bias is not None:
                     torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.vae.decoder.egnn.embedding")
-            else:
-                logging.warning("  model.vae.decoder.egnn.embedding is not nn.Linear")
-        else:
-            logging.warning("  Could not find model.vae.decoder.egnn.embedding for custom init.")
-        logging.info("Custom initialization attempt finished.")
-
+                logging.info("  Initialized model.vae.decoder.egnn.embedding with normal_(std=0.01)")
+        
+        logging.info("Conservative custom initialization attempt finished.")
     except Exception as e:
-        logging.error(f"Error during custom initialization: {e}", exc_info=True)
-
-initialize_problematic_layers(model, args) # Call the new function
-# --- End of Custom Initialization ---
+        logging.error(f"Error during conservative custom initialization: {e}", exc_info=True)
+# --- End of Custom Conservative Initialization ---
 
 
-# --- Load Pretrained Weights --- 
+# --- Load Pretrained Weights & Identify Mismatched for LSUV ---
 model_path = join(args.pretrained_path, args.model_name)
+mismatched_module_paths_for_lsuv = set() # Use a set to store unique module paths
+
+logging.info(f"Attempting to load pretrained weights from {model_path}...")
 try:
     state_dict = torch.load(model_path, map_location=device)
-    if all(key.startswith('module.') for key in state_dict.keys()):
+    if any(key.startswith('module.') for key in state_dict.keys()): # Check if any key starts with 'module.'
         logging.info("Removing 'module.' prefix from state_dict keys.")
         state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
     
-    # Manual loading to bypass strict=False issues with RuntimeError
-    logging.info("Attempting to load pretrained weights manually (parameter by parameter)...")
-    model_dict = model.state_dict()
+    model_state_dict_ref = model.state_dict() # Reference current model state
     loaded_keys = set()
     skipped_keys_size_mismatch = []
-    skipped_keys_other = []
+    skipped_keys_other = [] # Keys in checkpoint not in model, or other load errors
 
-    for k, v_checkpoint in state_dict.items():
-        if k in model_dict:
-            v_model = model_dict[k]
+    final_state_dict_to_load = {} # Build a state_dict of only matching parameters
+
+    for k_checkpoint, v_checkpoint in state_dict.items():
+        if k_checkpoint in model_state_dict_ref:
+            v_model = model_state_dict_ref[k_checkpoint]
             if v_model.shape == v_checkpoint.shape:
-                try:
-                    # Directly load the parameter into the model for this key
-                    model_dict[k] = v_checkpoint # Update the model's state_dict entry
-                    loaded_keys.add(k)
-                except Exception as e:
-                    logging.warning(f"  Could not load key '{k}' due to an unexpected error: {e}")
-                    skipped_keys_other.append(k)
+                final_state_dict_to_load[k_checkpoint] = v_checkpoint
+                loaded_keys.add(k_checkpoint)
             else:
-                logging.warning(f"  Skipping key '{k}' due to size mismatch: Model shape {v_model.shape}, Checkpoint shape {v_checkpoint.shape}")
-                skipped_keys_size_mismatch.append(k)
+                logging.warning(f"  Skipping key '{k_checkpoint}' due to size mismatch: Model shape {v_model.shape}, Checkpoint shape {v_checkpoint.shape}")
+                skipped_keys_size_mismatch.append(k_checkpoint)
+                # Extract module path for LSUV: e.g., 'dynamics.egnn.embedding' from 'dynamics.egnn.embedding.weight'
+                module_path = '.'.join(k_checkpoint.split('.')[:-1]) # Remove .weight or .bias
+                mismatched_module_paths_for_lsuv.add(module_path)
         else:
-            logging.warning(f"  Skipping key '{k}' from checkpoint as it's not in the current model.")
-            skipped_keys_other.append(k)
+            logging.warning(f"  Skipping key '{k_checkpoint}' from checkpoint as it's not in the current model architecture.")
+            skipped_keys_other.append(k_checkpoint)
 
-    # After preparing model_dict with matching parameters, load it into the model.
-    # Using strict=False here is a final fallback for any unexpected issues,
-    # but the main filtering is done above.
-    model.load_state_dict(model_dict, strict=False) 
+    # Load the carefully constructed state dict
+    # Using strict=False here is a final fallback, but we've already done the filtering.
+    # More robust is to load into a fresh copy of the model or model.load_state_dict(final_state_dict_to_load, strict=False)
+    # For simplicity, we'll assume model.load_state_dict can handle missing keys gracefully if strict=False
+    # and we only provide matching ones.
+    # However, the primary goal is to apply `final_state_dict_to_load`.
+    # Let's update the model's state dict directly for the keys we want to load.
+    
+    current_model_sd = model.state_dict()
+    current_model_sd.update(final_state_dict_to_load) # Update with loaded weights
+    model.load_state_dict(current_model_sd) # Load the updated state dict
 
-    logging.info(f"Successfully attempted manual load of pretrained weights from {model_path}")
-    if loaded_keys:
-        logging.info(f"  Loaded {len(loaded_keys)} matching parameters.")
+    logging.info(f"Successfully attempted load of pretrained weights.")
+    logging.info(f"  Loaded {len(loaded_keys)} matching parameters.")
     if skipped_keys_size_mismatch:
-        logging.warning(f"  Skipped {len(skipped_keys_size_mismatch)} keys due to size mismatches: {skipped_keys_size_mismatch}")
+        logging.warning(f"  Skipped {len(skipped_keys_size_mismatch)} keys from {len(mismatched_module_paths_for_lsuv)} unique modules due to size mismatches: {skipped_keys_size_mismatch}")
     if skipped_keys_other:
-        logging.warning(f"  Skipped {len(skipped_keys_other)} other keys (e.g., not in model, other load errors): {skipped_keys_other}")
+        logging.warning(f"  Skipped {len(skipped_keys_other)} other keys (e.g., not in model): {skipped_keys_other}")
 
 except FileNotFoundError:
     logging.error(f"Error: Pretrained model file not found at {model_path}. Exiting.")
     exit(1)
+except Exception as e_load:
+    logging.error(f"Error loading pretrained weights: {e_load}", exc_info=True)
+    # Decide if to exit or continue without pretrained weights / LSUV
+    # For now, let's assume if loading fails, LSUV on mismatched might not make sense or use all layers
+    mismatched_module_paths_for_lsuv.clear() # Don't do LSUV if loading failed badly
 
 model = model.to(device)
-model_dp = model # No DataParallel wrapper for simplicity, assume single GPU
+model_dp = model # No DataParallel wrapper
+
+# --- FREEZE DYNAMICS MODEL & SELECTIVELY UNFREEZE MISMATCHED LAYERS (NEW) ---
+if hasattr(model, 'dynamics') and model.dynamics is not None:
+    logging.info("Freezing all parameters in model.dynamics...")
+    for param in model.dynamics.parameters():
+        param.requires_grad = False
+    
+    layers_to_unfreeze_in_dynamics = []
+    # Unfreeze model.dynamics.egnn.embedding if it exists
+    dyn_embedding_layer = get_layer_by_path(model, "dynamics.egnn.embedding")
+    if dyn_embedding_layer and isinstance(dyn_embedding_layer, torch.nn.Module):
+        logging.info("  Unfreezing model.dynamics.egnn.embedding parameters.")
+        for param in dyn_embedding_layer.parameters():
+            param.requires_grad = True
+        layers_to_unfreeze_in_dynamics.append("dynamics.egnn.embedding")
+    else:
+        logging.warning("  Could not find model.dynamics.egnn.embedding to unfreeze.")
+
+    # Unfreeze the LAST GCL layer in model.dynamics.egnn.gcl_layers (NEW)
+    if hasattr(args, 'n_layers') and args.n_layers > 0:
+        last_gcl_layer_idx = args.n_layers - 1
+        last_gcl_layer_path = f"dynamics.egnn.gcl_layers.{last_gcl_layer_idx}"
+        dyn_last_gcl_layer = get_layer_by_path(model, last_gcl_layer_path)
+        if dyn_last_gcl_layer and isinstance(dyn_last_gcl_layer, torch.nn.Module):
+            logging.info(f"  Unfreezing {last_gcl_layer_path} parameters.")
+            for param in dyn_last_gcl_layer.parameters():
+                param.requires_grad = True
+            layers_to_unfreeze_in_dynamics.append(last_gcl_layer_path)
+        else:
+            logging.warning(f"  Could not find {last_gcl_layer_path} to unfreeze.")
+    else:
+        logging.warning("  args.n_layers not available or invalid, cannot unfreeze last GCL layer.")
+
+    # Unfreeze model.dynamics.egnn.embedding_out if it exists
+    dyn_embedding_out_layer = get_layer_by_path(model, "dynamics.egnn.embedding_out")
+    if dyn_embedding_out_layer and isinstance(dyn_embedding_out_layer, torch.nn.Module):
+        logging.info("  Unfreezing model.dynamics.egnn.embedding_out parameters.")
+        for param in dyn_embedding_out_layer.parameters():
+            param.requires_grad = True
+        layers_to_unfreeze_in_dynamics.append("dynamics.egnn.embedding_out")
+    else:
+        logging.warning("  Could not find model.dynamics.egnn.embedding_out to unfreeze.")
+    logging.info("Selective freezing/unfreezing of dynamics model complete.")
+else:
+    logging.warning("model.dynamics not found, skipping selective freezing.")
+
+# Note: VAE freezing is handled by args.trainable_ae = False, which should prevent its params from being passed to optimizer
+# or by ensuring get_optim filters by requires_grad.
+
+# Update mismatched_module_paths_for_lsuv to only include the ones we actually unfroze and want to LSUV
+# This assumes LSUV should only run on trainable layers we are trying to adapt.
+# The original mismatched_module_paths_for_lsuv included VAE layers if they were mismatched.
+# For VAE layers, if trainable_ae is False, LSUV on them is moot as they won't train.
+# So, we refine mismatched_module_paths_for_lsuv for clarity and intent.
+
+final_mismatched_paths_for_lsuv = []
+if "dynamics.egnn.embedding" in layers_to_unfreeze_in_dynamics and "dynamics.egnn.embedding" in mismatched_module_paths_for_lsuv:
+    final_mismatched_paths_for_lsuv.append("dynamics.egnn.embedding")
+if "dynamics.egnn.embedding_out" in layers_to_unfreeze_in_dynamics and "dynamics.egnn.embedding_out" in mismatched_module_paths_for_lsuv:
+    final_mismatched_paths_for_lsuv.append("dynamics.egnn.embedding_out")
+
+# If VAE is trainable (args.trainable_ae is True) and has mismatched layers identified for LSUV:
+if args.trainable_ae: # This should be false based on current logs, but good practice for robustness
+    if "vae.encoder.final_mlp.2" in mismatched_module_paths_for_lsuv:
+        final_mismatched_paths_for_lsuv.append("vae.encoder.final_mlp.2")
+    if "vae.decoder.egnn.embedding" in mismatched_module_paths_for_lsuv:
+        final_mismatched_paths_for_lsuv.append("vae.decoder.egnn.embedding")
+
+# Add the last GCL layer to LSUV targets if it was unfrozen and originally mismatched (NEW)
+if hasattr(args, 'n_layers') and args.n_layers > 0:
+    last_gcl_layer_idx = args.n_layers - 1
+    last_gcl_layer_path = f"dynamics.egnn.gcl_layers.{last_gcl_layer_idx}"
+    if last_gcl_layer_path in layers_to_unfreeze_in_dynamics and last_gcl_layer_path in mismatched_module_paths_for_lsuv:
+        if last_gcl_layer_path not in final_mismatched_paths_for_lsuv: # Avoid duplicates
+             final_mismatched_paths_for_lsuv.append(last_gcl_layer_path)
+
+logging.info(f"Final module paths targeted for LSUV (must be trainable and originally mismatched): {final_mismatched_paths_for_lsuv}")
+
+# --- LSUV-like Initialization for Mismatched Layers (NEW) ---
+if final_mismatched_paths_for_lsuv: # Use the filtered list
+    logging.info("Preparing for LSUV-like initialization of specified trainable mismatched modules...")
+    # Ensure dataloaders are available
+    if 'train' not in dataloaders or not dataloaders['train']:
+        logging.error("Training dataloader not available for LSUV. Skipping LSUV.")
+    else:
+        try:
+            sample_batch_for_lsuv = next(iter(dataloaders['train']))
+            lsuv_initialize_modules(
+                model, 
+                list(final_mismatched_paths_for_lsuv),  # Use the filtered list
+                sample_batch_for_lsuv, 
+                args, # Pass the main args object
+                device, 
+                dtype, 
+                target_std=0.05,
+                target_mean=0.0,
+                iterations=10,
+                tolerance=0.01
+            )
+        except Exception as e_lsuv:
+            logging.error(f"Error during LSUV-like initialization: {e_lsuv}", exc_info=True)
+            logging.error("Continuing without LSUV adjustments due to error.")
+else:
+    logging.info("No trainable mismatched modules identified for LSUV-like init. Skipping LSUV.")
+# --- End of LSUV ---
+
 
 # --- Setup Optimizer --- 
-optim = get_optim(args, model) # Gets optimizer based on args.lr
+optim = get_optim(args, model) # get_optim should filter for param.requires_grad == True
 logging.info(f"Optimizer created with LR: {args.lr}")
+# Count trainable parameters
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+logging.info(f"Total trainable parameters: {trainable_params}")
+
 gradnorm_queue = utils.Queue()
-gradnorm_queue.add(3000) # Initialize large value
+gradnorm_queue.add(100) # Initialize with a more conservative value
 
 # --- Setup EMA --- 
 if args.ema_decay > 0:
@@ -494,10 +809,20 @@ for epoch in range(args.n_epochs):
 
     pbar = tqdm(dataloaders['train'], desc=f"Epoch {epoch+1}/{args.n_epochs} (Stage 1)")
     for i, data in enumerate(pbar):
+        # --- CRITICAL NaN CHECK FOR RAW INPUT (NEW) ---
+        if torch.isnan(data['positions']).any():
+            logging.error(f"CRITICAL NaN DETECTED IN RAW data['positions'] at Epoch {epoch+1}, Batch {i}. Skipping batch.")
+            # TODO: Consider saving problematic indices/data for offline analysis
+            # problematic_indices = data.get('idx', 'Unknown indices') 
+            # logging.error(f"Problematic indices (if available): {problematic_indices}")
+            # You might want to exit or implement more robust error handling/data skipping here.
+            continue # Skip this batch
+        # --- END OF CRITICAL NaN CHECK ---
+
         # --- Data Preparation --- 
         x = data['positions'].to(device, dtype)
         
-        # Check for NaNs in input positions
+        # Check for NaNs in input positions (this check is now somewhat redundant due to the one above, but kept for safety)
         if torch.isnan(x).any():
             logging.error(f"ERROR: NaN detected in input x (positions) at Epoch {epoch+1}, Batch {i}. Skipping batch.")
             # For more detailed debugging, you could print the problematic sample(s) or raise an error.
@@ -542,13 +867,44 @@ for epoch in range(args.n_epochs):
         one_hot = data['one_hot'].to(device, dtype)
         charges = data['charges'].to(device, dtype)
 
+        # --- Apply Pre-calculated Dataset-level Normalization (NEW) ---
+        # Ensure stats are on the same device as the data
+        dataset_x_mean_dev = args.dataset_x_mean.to(device)
+        dataset_x_std_dev = args.dataset_x_std.to(device)
+        dataset_h_cat_mean_dev = args.dataset_h_cat_mean.to(device)
+        dataset_h_cat_std_dev = args.dataset_h_cat_std.to(device)
+
+        # Normalize positions: (x - mean) / std. Unsqueeze to allow broadcasting.
+        x_normalized = (x - dataset_x_mean_dev.unsqueeze(0).unsqueeze(0)) / dataset_x_std_dev.unsqueeze(0).unsqueeze(0)
+        
+        # Normalize one-hot features: (h_cat - mean) / std. Unsqueeze to allow broadcasting.
+        one_hot_normalized = (one_hot - dataset_h_cat_mean_dev.unsqueeze(0).unsqueeze(0)) / dataset_h_cat_std_dev.unsqueeze(0).unsqueeze(0)
+
+        # NEW: Ensure masked parts are zero after normalization
+        x_normalized = x_normalized * node_mask
+        one_hot_normalized = one_hot_normalized * node_mask
+        # Charges are not included/normalized based on args.include_charges = False
+        # --- End of New Normalization ---
+
         # DEBUG: Print shapes just before the operation causing the error
         logging.debug(f"Epoch {epoch+1}, Batch {i}: original_atom_mask_shape = {original_atom_mask_shape}, x.shape = {x.shape}, final node_mask.shape = {node_mask.shape}")
         if x.shape[1] != node_mask.shape[1]:
             logging.warning(f"ALERT: Mismatch in n_nodes between x ({x.shape[1]}) and node_mask ({node_mask.shape[1]}) in batch {i}!")
 
-        x = diffusion_utils.remove_mean_with_mask(x, node_mask)
-        h = {'categorical': one_hot, 'integer': charges}
+        # The remove_mean_with_mask is usually applied by the model. 
+        # If we normalize x to have zero mean here, this call might become redundant or operate on already zero-mean data.
+        # Original model structure applies it to z (latent) or x input to diffusion.
+        # For now, we pass the normalized x and h to the loss function, which then feeds them to the model.
+        # The model's internal normalize() is now an identity op.
+        # The model's internal remove_mean_with_mask will still operate on its input (e.g. latents, or normalized x if VAE is bypassed).
+        
+        # Prepare x and h for the model/loss function
+        x_for_model = diffusion_utils.remove_mean_with_mask(x_normalized, node_mask) # Apply per-sample centering
+        
+        one_hot_for_model = one_hot_normalized * node_mask # Mask one-hot features
+        charges_for_model = charges * node_mask # Mask charges
+
+        h_for_model = {'categorical': one_hot_for_model, 'integer': charges_for_model}
 
         # --- Context Preparation --- 
         context = None # No context for unconditional adaptation
@@ -556,9 +912,9 @@ for epoch in range(args.n_epochs):
         # --- Loss Calculation --- 
         optim.zero_grad()
         try:
-            # Call loss function with context=None
+            # Call loss function with context=None, using externally normalized x and h
             nll, reg_term, mean_abs_z = qm9_losses.compute_loss_and_nll(args, model_dp, nodes_dist,
-                                                                      x, h, node_mask, edge_mask, context=None)
+                                                                      x_for_model, h_for_model, node_mask, edge_mask, context=None)
             loss = nll + args.ode_regularization * reg_term
 
             if torch.isnan(loss):
@@ -614,14 +970,46 @@ for epoch in range(args.n_epochs):
             pbar_val = tqdm(dataloaders['val'], desc=f"Validation Epoch {epoch+1} (Stage 1)")
             for data in pbar_val:
                 # --- Validation Data Prep --- 
-                x = data['positions'].to(device, dtype)
-                batch_size = x.size(0)
-                node_mask = data['atom_mask'].to(device, dtype).unsqueeze(2)
-                edge_mask = data['edge_mask'].to(device, dtype)
-                one_hot = data['one_hot'].to(device, dtype)
-                charges = data['charges'].to(device, dtype)
-                x = diffusion_utils.remove_mean_with_mask(x, node_mask)
-                h = {'categorical': one_hot, 'integer': charges}
+                x_raw_val = data['positions'].to(device, dtype)
+                one_hot_raw_val = data['one_hot'].to(device, dtype)
+                charges_val_raw = data['charges'].to(device, dtype) # Use a distinct name for raw charges
+                
+                batch_size = x_raw_val.size(0)
+                # Use distinct variable name for validation node_mask to avoid confusion with training loop
+                node_mask_val = data['atom_mask'].to(device, dtype)
+                if node_mask_val.ndim == 2: # Ensure (B,N)
+                     node_mask_val = node_mask_val # Keep as (B,N) for unsqueeze later if needed by specific functions
+                # Reshape to (B, N, 1) for broadcasting and functions expecting it like remove_mean_with_mask
+                node_mask_for_ops_val = node_mask_val.unsqueeze(-1) if node_mask_val.ndim == 2 else node_mask_val 
+                if node_mask_for_ops_val.ndim != 3 or node_mask_for_ops_val.shape[-1] !=1:
+                    # Attempt to fix or log error if shape is still not (B,N,1)
+                    logging.warning(f"Valid. node_mask_for_ops_val unexpected shape: {node_mask_for_ops_val.shape}. Re-checking original atom_mask shape: {data['atom_mask'].shape}")
+                    # Add robust reshaping if necessary, similar to training loop if problems persist
+                    # For now, assume it will be (B,N,1) after unsqueeze if original is (B,N)
+                
+                edge_mask_val = data['edge_mask'].to(device, dtype)
+
+                # Apply dataset-level normalization to validation data too
+                dataset_x_mean_dev = args.dataset_x_mean.to(device)
+                dataset_x_std_dev = args.dataset_x_std.to(device)
+                dataset_h_cat_mean_dev = args.dataset_h_cat_mean.to(device)
+                dataset_h_cat_std_dev = args.dataset_h_cat_std.to(device)
+
+                x_val_normalized = (x_raw_val - dataset_x_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_x_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
+                one_hot_val_normalized = (one_hot_raw_val - dataset_h_cat_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_h_cat_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
+                
+                # --- Explicitly mask x_val_normalized BEFORE remove_mean_with_mask (NEW) ---
+                x_val_normalized = x_val_normalized * node_mask_for_ops_val
+                # --- End of NEW ---
+
+                # The problematic line `x_val_normalized = x_val_normalized * node_mask` should be removed.
+                # Correct processing for x and h for the model:
+                x_val_for_model = diffusion_utils.remove_mean_with_mask(x_val_normalized, node_mask_for_ops_val) 
+
+                one_hot_val_for_model = one_hot_val_normalized * node_mask_for_ops_val 
+                charges_val_for_model = charges_val_raw * node_mask_for_ops_val # Mask raw charges
+                
+                h_val_for_model = {'categorical': one_hot_val_for_model, 'integer': charges_val_for_model}
                 
                 # --- Validation Context --- 
                 context = None # No context for unconditional validation
@@ -629,8 +1017,10 @@ for epoch in range(args.n_epochs):
                 # --- Validation Loss Calculation --- 
                 try:
                      # Call loss function with context=None
-                    nll, _, _ = qm9_losses.compute_loss_and_nll(args, model_eval_dp, nodes_dist, x, h,
-                                                                 node_mask, edge_mask, context=None)
+                    nll, _, _ = qm9_losses.compute_loss_and_nll(args, model_eval_dp, nodes_dist, 
+                                                                 x_val_for_model, h_val_for_model,
+                                                                 node_mask_for_ops_val, # Use the correctly shaped mask
+                                                                 edge_mask_val, context=None)
                     if not torch.isnan(nll):
                         val_nll += nll.item() * batch_size
                         n_val_samples += batch_size

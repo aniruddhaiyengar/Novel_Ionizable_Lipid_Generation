@@ -13,8 +13,7 @@ PROCESSED_UNLABELED_PKL = os.path.join(OUTPUT_DIR, "processed_unlabeled_lipids.p
 MAX_MOLECULES_TO_PROCESS = 10000  # Stop after processing this many molecules
 
 # Define the atom types expected in the dataset (ensure consistency with other scripts)
-# ATOM_DECODER = ['H', 'C', 'N', 'O', 'P'] # Original 5 types
-# New ATOM_DECODER to match geom_with_h from GeoLDM/configs/datasets_config.py
+# Match exactly with the model's atom decoder
 ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
 NUM_ATOM_TYPES = len(ATOM_DECODER) # Should be 16
@@ -23,15 +22,16 @@ NUM_ATOM_TYPES = len(ATOM_DECODER) # Should be 16
 
 def generate_conformer_from_mol(mol):
     """
-    Adds hydrogens, generates a 3D conformer, optimizes, and computes Gasteiger charges
+    Generates a 3D conformer, optimizes, and computes Gasteiger charges
     for a given RDKit molecule object (potentially read from SDF).
     Tries fallback methods if ETKDG fails.
+    Note: Does not add hydrogens as we're working with molecules without hydrogens.
 
     Args:
         mol (rdkit.Chem.Mol): The RDKit molecule object.
 
     Returns:
-        rdkit.Chem.Mol or None: The RDKit molecule object with added Hs, 3D conformer, and charges,
+        rdkit.Chem.Mol or None: The RDKit molecule object with 3D conformer and charges,
                                 or None if processing fails.
     """
     try:
@@ -41,8 +41,7 @@ def generate_conformer_from_mol(mol):
         # Get name for logging if available
         mol_name = mol.GetProp("_Name") if mol.HasProp("_Name") else "unknown_molecule"
 
-        # Add hydrogens (important for accurate charges and geometry)
-        mol = Chem.AddHs(mol, addCoords=True) # addCoords helps if input had some 3D info
+        # Note: We don't add hydrogens here since we're working with molecules without hydrogens
 
         conf_id = -1
         # Try using existing conformer first if available from SDF

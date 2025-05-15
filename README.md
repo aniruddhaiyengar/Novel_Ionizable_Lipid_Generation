@@ -107,7 +107,7 @@ Follow these steps sequentially.
         --n_epochs 50 \
         --batch_size 4 \
         --no-condition_time_cmd  \
-        --lr 1e-6 \
+        --lr 5e-9 \
         --no-trainable_ae_cmd \
         --val_split_ratio 0.01 &> outputs/lipid_adapt_stage1_run1/experiment_full.log
         
@@ -125,7 +125,7 @@ Follow these steps sequentially.
     *   Adapted model checkpoint from Stage 1.
 *   **Command** (adjust paths, checkpoint names, epochs, LR etc. as needed):
     ```bash
-    python GeoLDM/finetune_lipids.py \
+    python -m GeoLDM.finetune_lipids \
         --lipid_data_path "data/processed_train_lipids.pkl" \
         --lipid_stats_path "data/lipid_stats.pkl" \
         --pretrained_path "outputs/stage1_adapt/lipid_adapt_stage1_run1/checkpoints/" \
@@ -133,9 +133,9 @@ Follow these steps sequentially.
         --conditioning transfection_score \
         --exp_name "lipid_finetune_stage2_run1" \
         --output_dir "outputs/stage2_finetune" \
-        --n_epochs 100 \
-        --batch_size 32 \
-        --lr 2e-5
+        --n_epochs 75 \
+        --batch_size 8 \
+        --lr 5e-8  &> outputs/lipid_stage2_finetuning/experiment_full.log
     ```
 *   **Output**: Saves the final fine-tuned model checkpoints (e.g., `generative_model_ema_best.npy`) into `outputs/stage2_finetune/lipid_finetune_stage2_run1/checkpoints/`. This is the model to use for conditional generation.
 

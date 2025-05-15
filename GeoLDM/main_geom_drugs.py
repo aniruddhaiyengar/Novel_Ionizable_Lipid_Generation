@@ -11,9 +11,8 @@ import argparse
 import wandb
 from os.path import join
 from core.models import get_optim, get_model, get_autoencoder, get_latent_diffusion
-from equivariant_diffusion import en_diffusion
-
-from equivariant_diffusion import utils as diffusion_utils
+from GeoLDM.equivariant_diffusion import en_diffusion
+from GeoLDM.equivariant_diffusion import utils as diffusion_utils
 import torch
 import time
 import pickle
@@ -109,7 +108,7 @@ parser.add_argument('--resume', type=str, default=None,
                     help='')
 parser.add_argument('--start_epoch', type=int, default=0,
                     help='')
-parser.add_argument('--ema_decay', type=float, default=0,           # TODO
+parser.add_argument('--ema_decay', type=float, default=0,           # Default 0 means EMA is off. Use 0.999 for EMA.
                     help='Amount of EMA decay, 0 means off. A reasonable value'
                          ' is 0.999.')
 parser.add_argument('--augment_noise', type=float, default=0)

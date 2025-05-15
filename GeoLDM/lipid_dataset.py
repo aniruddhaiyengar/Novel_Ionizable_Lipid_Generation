@@ -3,6 +3,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import pickle
 import numpy as np
 import os
+import logging
 
 class LipidDataset(Dataset):
     """PyTorch Dataset for loading processed lipid molecule data."""
@@ -15,6 +16,15 @@ class LipidDataset(Dataset):
                               and optionally a conditioning key (e.g., 'transfection_score').
         """
         self.data_list = data_list
+        
+        # Create data attribute with num_atoms information and property values
+        self.data = {
+            'num_atoms': torch.tensor([len(item['positions']) for item in data_list])
+        }
+        
+        # Add property values if they exist in the data
+        if data_list and 'transfection_score' in data_list[0]:
+            self.data['transfection_score'] = torch.tensor([item['transfection_score'] for item in data_list])
 
     def __len__(self):
         """Returns the number of molecules in the dataset."""
@@ -22,8 +32,67 @@ class LipidDataset(Dataset):
 
     def __getitem__(self, idx):
         """Returns the data dictionary for the molecule at the given index."""
-        # Return a copy to avoid unintended modifications
-        return self.data_list[idx].copy()
+        data = self.data_list[idx]
+        
+        # Convert positions to float tensor and add batch dimension
+        positions = torch.from_numpy(data["positions"]).float()
+        if positions.dim() == 2:
+            positions = positions.unsqueeze(0)  # Add batch dimension
+        
+        # Convert one_hot to float tensor and add batch dimension if needed
+        one_hot = torch.from_numpy(data["one_hot"]).float()
+        if one_hot.dim() == 2:
+            one_hot = one_hot.unsqueeze(0)  # Add batch dimension
+        
+        # Convert charges to float tensor with proper shape
+        charges = torch.from_numpy(data["charges"]).float() if "charges" in data else torch.zeros_like(one_hot[:, :, :1])
+        
+        # Convert atom_mask to float tensor with explicit values and proper shape
+        atom_mask = torch.from_numpy(data["atom_mask"]).float()
+        if atom_mask.dim() == 2:
+            atom_mask = atom_mask.unsqueeze(0)  # Add batch dimension
+        atom_mask = (atom_mask > 0.5).float()
+        
+        # Ensure edge mask is also float with proper shape
+        if "edge_mask" in data:
+            edge_mask = torch.from_numpy(data["edge_mask"]).float()
+            if edge_mask.dim() == 2:
+                edge_mask = edge_mask.unsqueeze(0)
+            edge_mask = (edge_mask > 0.5).float()
+        else:
+            # Create default edge mask based on atom_mask if not provided
+            n_nodes = atom_mask.size(1)  # Get number of nodes
+            # Create adjacency matrix: [batch_size, n_nodes, n_nodes]
+            edge_mask = torch.matmul(
+                atom_mask.transpose(1, 2),  # [batch_size, 1, n_nodes]
+                atom_mask  # [batch_size, n_nodes, 1]
+            )  # Results in [batch_size, n_nodes, n_nodes]
+            
+            # Remove self-loops
+            diag_mask = ~torch.eye(n_nodes, dtype=torch.bool).unsqueeze(0)
+            edge_mask = edge_mask * diag_mask
+        
+        # Validate shapes and types
+        assert positions.dim() == 3, f"Positions should be 3D tensor, got shape {positions.shape}"
+        assert one_hot.dim() == 3, f"One-hot should be 3D tensor, got shape {one_hot.shape}"
+        assert atom_mask.dim() == 3, f"Atom mask should be 3D tensor, got shape {atom_mask.shape}"
+        assert edge_mask.dim() == 3, f"Edge mask should be 3D tensor, got shape {edge_mask.shape}"
+        assert edge_mask.shape[1] == edge_mask.shape[2], f"Edge mask should be square, got shape {edge_mask.shape}"
+        
+        # Create return dictionary
+        return_dict = {
+            "positions": positions,
+            "one_hot": one_hot,
+            "charges": charges,
+            "atom_mask": atom_mask,
+            "edge_mask": edge_mask
+        }
+        
+        # Add transfection score if it exists
+        if "transfection_score" in data:
+            return_dict["transfection_score"] = torch.tensor(data["transfection_score"], dtype=torch.float32)
+        
+        return return_dict
 
 def lipid_collate_fn(batch):
     """
@@ -35,83 +104,96 @@ def lipid_collate_fn(batch):
 
     Returns:
         dict: A dictionary containing batched and padded tensors.
-              Keys: 'positions', 'one_hot', 'charges', 'atom_mask', 'edge_mask',
-              and the conditioning key if present in the input batch items.
     """
+    if not batch:
+        raise ValueError("Empty batch received")
+        
     # Find the maximum number of atoms in the batch
-    max_atoms = 0
-    for item in batch:
-        # Ensure 'atom_mask' key exists
-        if 'atom_mask' not in item:
-            raise ValueError(f"Missing 'atom_mask' in dataset item: {item.keys()}")
-        max_atoms = max(max_atoms, item['atom_mask'].shape[0])
+    max_atoms = max(item['atom_mask'].shape[1] for item in batch)
 
-    # Initialize lists to hold padded data for each key
+    # Initialize lists to hold padded data
     batch_positions = []
     batch_one_hot = []
     batch_charges = []
     batch_atom_mask = []
-    batch_conditioning = [] # Store conditioning values if they exist
+    batch_transfection_scores = []
 
-    # Check if conditioning data is present in the first item (assume consistency)
-    conditioning_key = None
-    if batch:
-        # Find a key that is not one of the standard ones
-        standard_keys = {'positions', 'one_hot', 'charges', 'atom_mask'}
-        extra_keys = [k for k in batch[0].keys() if k not in standard_keys]
-        if len(extra_keys) == 1:
-            conditioning_key = extra_keys[0]
-        elif len(extra_keys) > 1:
-            print(f"Warning: Multiple potential conditioning keys found: {extra_keys}. Using the first one: {extra_keys[0]}")
-            conditioning_key = extra_keys[0]
-
-    # Pad each molecule's data and append to batch lists
+    # Pad each molecule's data
     for item in batch:
-        num_atoms = item['atom_mask'].shape[0]
+        num_atoms = item['atom_mask'].shape[1]
         padding_size = max_atoms - num_atoms
 
-        # Pad 'positions' (N, 3)
-        padded_positions = np.pad(item['positions'], ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
+        # Convert to numpy arrays if they aren't already
+        positions = item['positions'].numpy() if torch.is_tensor(item['positions']) else item['positions']
+        one_hot = item['one_hot'].numpy() if torch.is_tensor(item['one_hot']) else item['one_hot']
+        charges = item['charges'].numpy() if torch.is_tensor(item['charges']) else item['charges']
+        atom_mask = item['atom_mask'].numpy() if torch.is_tensor(item['atom_mask']) else item['atom_mask']
+
+        # Remove batch dimension for padding if it exists
+        if positions.ndim == 3 and positions.shape[0] == 1:
+            positions = positions.squeeze(0)
+        if one_hot.ndim == 3 and one_hot.shape[0] == 1:
+            one_hot = one_hot.squeeze(0)
+        if charges.ndim == 3 and charges.shape[0] == 1:
+            charges = charges.squeeze(0)
+        if atom_mask.ndim == 3 and atom_mask.shape[0] == 1:
+            atom_mask = atom_mask.squeeze(0)
+
+        # Pad arrays
+        padded_positions = np.pad(positions, ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
+        padded_one_hot = np.pad(one_hot, ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
+        padded_charges = np.pad(charges, ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
+        padded_atom_mask = np.pad(atom_mask, ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
+
+        # Add batch dimension back
+        padded_positions = np.expand_dims(padded_positions, axis=0)
+        padded_one_hot = np.expand_dims(padded_one_hot, axis=0)
+        padded_charges = np.expand_dims(padded_charges, axis=0)
+        padded_atom_mask = np.expand_dims(padded_atom_mask, axis=0)
+
         batch_positions.append(padded_positions)
-
-        # Pad 'one_hot' (N, num_atom_types)
-        padded_one_hot = np.pad(item['one_hot'], ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
         batch_one_hot.append(padded_one_hot)
-
-        # Pad 'charges' (N, 1)
-        padded_charges = np.pad(item['charges'], ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
         batch_charges.append(padded_charges)
-
-        # Pad 'atom_mask' (N, 1)
-        padded_atom_mask = np.pad(item['atom_mask'], ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
         batch_atom_mask.append(padded_atom_mask)
 
-        # Append conditioning value if present
-        if conditioning_key and conditioning_key in item:
-            batch_conditioning.append(item[conditioning_key])
+        # Handle transfection score
+        if 'transfection_score' in item:
+            score = item['transfection_score']
+            if torch.is_tensor(score):
+                score = score.item()
+            batch_transfection_scores.append(score)
 
-    # Stack lists into tensors
+    # Convert to tensors and ensure proper types
     batch_dict = {
-        'positions': torch.tensor(np.stack(batch_positions), dtype=torch.float32),
-        'one_hot': torch.tensor(np.stack(batch_one_hot), dtype=torch.float32),
-        'charges': torch.tensor(np.stack(batch_charges), dtype=torch.float32),
-        'atom_mask': torch.tensor(np.stack(batch_atom_mask), dtype=torch.float32)
+        'positions': torch.tensor(np.concatenate(batch_positions, axis=0), dtype=torch.float32),
+        'one_hot': torch.tensor(np.concatenate(batch_one_hot, axis=0), dtype=torch.float32),
+        'charges': torch.tensor(np.concatenate(batch_charges, axis=0), dtype=torch.float32),
+        'atom_mask': torch.tensor(np.concatenate(batch_atom_mask, axis=0), dtype=torch.float32)
     }
 
-    # Add conditioning tensor if data was present
-    if conditioning_key and batch_conditioning:
-        # Assuming scalar conditioning values for now
-        batch_dict[conditioning_key] = torch.tensor(batch_conditioning, dtype=torch.float32).unsqueeze(1) # Add feature dim
+    # Add transfection scores if present
+    if batch_transfection_scores:
+        batch_dict['transfection_score'] = torch.tensor(batch_transfection_scores, dtype=torch.float32).view(-1, 1)
 
-    # Create edge mask (batch_size, max_atoms, max_atoms)
-    # An edge exists if both atoms are real (mask is 1)
-    atom_mask_squeezed = batch_dict['atom_mask'].squeeze(-1) # (batch_size, max_atoms)
+    # Create edge mask
+    atom_mask_squeezed = batch_dict['atom_mask'].squeeze(-1)  # Remove last dimension if present
     edge_mask = atom_mask_squeezed.unsqueeze(1) * atom_mask_squeezed.unsqueeze(2)
+    
+    # Remove self-loops
+    diag_mask = ~torch.eye(edge_mask.size(1), dtype=torch.bool, device=edge_mask.device).unsqueeze(0)
+    edge_mask = edge_mask * diag_mask
+    
     batch_dict['edge_mask'] = edge_mask
+
+    # Validate shapes and types
+    assert batch_dict['positions'].dim() == 3, f"Positions should be 3D tensor, got shape {batch_dict['positions'].shape}"
+    assert batch_dict['one_hot'].dim() == 3, f"One-hot should be 3D tensor, got shape {batch_dict['one_hot'].shape}"
+    assert batch_dict['atom_mask'].dim() == 3, f"Atom mask should be 3D tensor, got shape {batch_dict['atom_mask'].shape}"
+    assert batch_dict['edge_mask'].dim() == 3, f"Edge mask should be 3D tensor, got shape {batch_dict['edge_mask'].shape}"
 
     return batch_dict
 
-def get_dataloaders(data_path, batch_size, num_workers=0, seed=42, val_split_ratio=0.1):
+def get_dataloaders(data_path, batch_size, num_workers=0, seed=42, val_split_ratio=0.1, lipid_stats_path=None, is_stage2_data=False):
     """
     Loads processed lipid data, creates Datasets and DataLoaders for train and validation.
 
@@ -126,6 +208,8 @@ def get_dataloaders(data_path, batch_size, num_workers=0, seed=42, val_split_rat
         seed (int): Random seed for train/validation split. Defaults to 42.
         val_split_ratio (float): Fraction of data to use for validation if no validation file is found.
                                  Defaults to 0.1 (10%).
+        lipid_stats_path (str, optional): Path to lipid_stats.pkl for property normalization.
+        is_stage2_data (bool): Whether this is stage 2 data with property conditioning.
 
     Returns:
         dict: A dictionary containing 'train' and 'val' DataLoaders.
@@ -140,6 +224,18 @@ def get_dataloaders(data_path, batch_size, num_workers=0, seed=42, val_split_rat
         if not all_data:
              raise ValueError(f"Pickle file {data_path} is empty.")
         print(f"Successfully loaded {len(all_data)} molecules from {data_path}.")
+
+        # Load lipid stats if provided
+        if lipid_stats_path and is_stage2_data:
+            try:
+                with open(lipid_stats_path, 'rb') as f:
+                    lipid_stats = pickle.load(f)
+                print(f"Successfully loaded lipid stats from {lipid_stats_path}")
+            except Exception as e:
+                print(f"Warning: Could not load lipid stats from {lipid_stats_path}: {e}")
+                lipid_stats = None
+        else:
+            lipid_stats = None
 
     except FileNotFoundError:
         print(f"Error: Data file not found at {data_path}")

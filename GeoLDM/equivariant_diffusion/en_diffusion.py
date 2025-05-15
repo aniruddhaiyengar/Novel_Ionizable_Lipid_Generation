@@ -3,7 +3,6 @@ import math
 import torch
 from GeoLDM.egnn import models
 from torch.nn import functional as F
-from GeoLDM.equivariant_diffusion import utils
 from GeoLDM.equivariant_diffusion import utils as diffusion_utils
 
 
