@@ -2,12 +2,15 @@ import torch
 from torch.distributions.categorical import Categorical
 
 import numpy as np
+# Use explicit relative path from GeoLDM
 from GeoLDM.egnn.models import EGNN_dynamics_QM9, EGNN_encoder_QM9, EGNN_decoder_QM9
 
+# Use explicit relative path from GeoLDM
 from GeoLDM.equivariant_diffusion.en_diffusion import EnVariationalDiffusion, EnHierarchicalVAE, EnLatentDiffusion
 
 import pickle
 from os.path import join
+import logging
 
 def get_model(args, device, dataset_info, dataloader_train):
     histogram = dataset_info['n_nodes']
@@ -52,8 +55,16 @@ def get_model(args, device, dataset_info, dataloader_train):
 
 
 def get_autoencoder(args, device, dataset_info, dataloader_train):
+    print(f"DEBUG STAGE1: In get_autoencoder, ENTRY args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}, args.include_charges = {getattr(args, 'include_charges', 'NOT FOUND')}") # Print on entry
     histogram = dataset_info['n_nodes']
-    in_node_nf = len(dataset_info['atom_decoder']) + int(args.include_charges)
+    # Original calculation:
+    # effective_in_node_nf_for_vae = 16 # OLD hardcoded value
+    # Use dynamic calculation based on the provided dataset_info and args
+    effective_in_node_nf_for_vae = len(dataset_info['atom_decoder']) + int(args.include_charges)
+    print(f"DEBUG STAGE1: In get_autoencoder, AFTER effective_in_node_nf_for_vae, args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}")
+    
+    logging.info(f"[get_autoencoder] Effective VAE in_node_nf: {effective_in_node_nf_for_vae} (from atom_decoder len {len(dataset_info['atom_decoder'])} + charges {int(args.include_charges)})")
+
     nodes_dist = DistributionNodes(histogram)
 
     prop_dist = None
@@ -62,43 +73,77 @@ def get_autoencoder(args, device, dataset_info, dataloader_train):
     # if len(args.conditioning) > 0:
     if len(conditioning_args) > 0:
         prop_dist = DistributionProperty(dataloader_train, conditioning_args)
+    print(f"DEBUG STAGE1: In get_autoencoder, AFTER prop_dist, args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}")
 
     # if args.condition_time:
     #     dynamics_in_node_nf = in_node_nf + 1
-    # else:
     print('Autoencoder models are _not_ conditioned on time.')
         # dynamics_in_node_nf = in_node_nf
     
+    # Use the main args.nf for the VAE's hidden dimension, unless a VAE-specific one is intended and correctly handled.
+    # The runtime error implies the loaded checkpoint's VAE encoder EGNN used hidden_nf=16.
+    # If we want to use args.nf (256), we set it here. This will likely cause weight mismatch for this layer.
+    vae_hidden_nf = args.nf 
+    print(f"DEBUG: [get_autoencoder] Using hidden_nf = {vae_hidden_nf} (from args.nf) for VAE encoder/decoder.")
+    print(f"DEBUG STAGE1: In get_autoencoder, AFTER vae_hidden_nf, args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}")
+
+    encoder_out_node_nf = args.latent_nf
+    print(f"CRITICAL LOG STAGE1: [get_autoencoder] Initializing VAE Encoder: args.latent_nf = {args.latent_nf}, computed encoder_out_node_nf (target for EGNN_encoder_QM9.out_node_nf) = {encoder_out_node_nf}")
+
     encoder = EGNN_encoder_QM9(
-        in_node_nf=in_node_nf, context_node_nf=args.context_node_nf, out_node_nf=args.latent_nf,
-        n_dims=3, device=device, hidden_nf=args.nf,
-        act_fn=torch.nn.SiLU(), n_layers=1,
-        attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
-        inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
-        include_charges=args.include_charges
+        in_node_nf=effective_in_node_nf_for_vae,  # Use modified value (dynamic)
+        context_node_nf=args.context_node_nf, 
+        # out_node_nf=args.latent_nf, # OLD: Incorrect for mu, sigma
+        out_node_nf=encoder_out_node_nf, # NEW: Encoder must output 2*latent_nf for mu and sigma
+        n_dims=3, 
+        device=device, 
+        hidden_nf=vae_hidden_nf,  # Use args.nf (e.g., 256)
+        act_fn=torch.nn.SiLU(), 
+        n_layers=args.n_layers, # Consider if VAE should have different n_layers than main model
+        attention=args.attention, 
+        tanh=args.tanh, 
+        mode=args.model, # This might need to be 'egnn_dynamics' or a VAE-specific mode if applicable
+        norm_constant=args.norm_constant,
+        inv_sublayers=args.inv_sublayers, 
+        sin_embedding=args.sin_embedding,
+        normalization_factor=args.normalization_factor, 
+        aggregation_method=args.aggregation_method,
+        include_charges=args.include_charges # This is for the EGNN_encoder_QM9 internal logic, if any
         )
+    print(f"DEBUG STAGE1: In get_autoencoder, AFTER encoder init, args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}")
     
     decoder = EGNN_decoder_QM9(
-        in_node_nf=args.latent_nf, context_node_nf=args.context_node_nf, out_node_nf=in_node_nf,
-        n_dims=3, device=device, hidden_nf=args.nf,
-        act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
-        attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
-        inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-        normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method,
+        in_node_nf=args.latent_nf, 
+        context_node_nf=args.context_node_nf, 
+        out_node_nf=effective_in_node_nf_for_vae, # Output should also match the 6 features
+        n_dims=3, 
+        device=device, 
+        hidden_nf=vae_hidden_nf, # Use args.nf (e.g., 256)
+        act_fn=torch.nn.SiLU(), 
+        n_layers=args.n_layers, # Consistent n_layers
+        attention=args.attention, 
+        tanh=args.tanh, 
+        mode=args.model, 
+        norm_constant=args.norm_constant,
+        inv_sublayers=args.inv_sublayers, 
+        sin_embedding=args.sin_embedding,
+        normalization_factor=args.normalization_factor, 
+        aggregation_method=args.aggregation_method,
         include_charges=args.include_charges
         )
+    print(f"DEBUG STAGE1: In get_autoencoder, AFTER decoder init, args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}")
 
     vae = EnHierarchicalVAE(
         encoder=encoder,
         decoder=decoder,
-        in_node_nf=in_node_nf,
+        in_node_nf=effective_in_node_nf_for_vae, # Pass the corrected value (6)
         n_dims=3,
         latent_node_nf=args.latent_nf,
         kl_weight=args.kl_weight,
         norm_values=args.normalize_factors,
-        include_charges=args.include_charges
+        include_charges=args.include_charges # This is for EnHierarchicalVAE internal logic
         )
+    print(f"DEBUG STAGE1: In get_autoencoder, AFTER VAE WRAPPER init, args.latent_nf = {getattr(args, 'latent_nf', 'NOT FOUND')}")
 
     return vae, nodes_dist, prop_dist
 
@@ -190,11 +235,11 @@ def get_latent_diffusion(args, device, dataset_info, dataloader_train):
         raise ValueError(f"Unknown probabilistic_model: {probabilistic_model}")
 
 
-def get_optim(args, generative_model):
+def get_optim(args, generative_model, weight_decay=1e-12):
     optim = torch.optim.AdamW(
         generative_model.parameters(),
         lr=args.lr, amsgrad=True,
-        weight_decay=1e-12)
+        weight_decay=weight_decay)
 
     return optim
 

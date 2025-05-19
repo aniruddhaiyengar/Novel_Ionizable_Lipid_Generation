@@ -107,7 +107,7 @@ Follow these steps sequentially.
         --n_epochs 50 \
         --batch_size 4 \
         --no-condition_time_cmd  \
-        --lr 1e-6 \
+        --lr 5e-6 \
         --no-trainable_ae_cmd \
         --val_split_ratio 0.01 &> outputs/lipid_adapt_stage1_run1/experiment_full.log
         
@@ -125,7 +125,7 @@ Follow these steps sequentially.
     *   Adapted model checkpoint from Stage 1.
 *   **Command** (adjust paths, checkpoint names, epochs, LR etc. as needed):
     ```bash
-    python GeoLDM/finetune_lipids.py \
+    python -m GeoLDM.finetune_lipids \
         --lipid_data_path "data/processed_train_lipids.pkl" \
         --lipid_stats_path "data/lipid_stats.pkl" \
         --pretrained_path "outputs/stage1_adapt/lipid_adapt_stage1_run1/checkpoints/" \
@@ -134,8 +134,9 @@ Follow these steps sequentially.
         --exp_name "lipid_finetune_stage2_run1" \
         --output_dir "outputs/stage2_finetune" \
         --n_epochs 100 \
-        --batch_size 32 \
-        --lr 2e-5
+        --batch_size 8 \
+        --lr 1e-5 \
+        &> outputs/lipid_stage2_finetuning/experiment_full.log
     ```
 *   **Output**: Saves the final fine-tuned model checkpoints (e.g., `generative_model_ema_best.npy`) into `outputs/stage2_finetune/lipid_finetune_stage2_run1/checkpoints/`. This is the model to use for conditional generation.
 
@@ -148,15 +149,23 @@ Follow these steps sequentially.
     *   `data/lipid_stats.pkl` (for conditioning).
 *   **Command** (adjust paths, checkpoint name, number of samples, target score standard deviation, and guidance scale `w` as needed):
     ```bash
+    "generative_model_ema_best.npy"
     python GeoLDM/generate_lipids.py \
-        --model_path "outputs/stage2_finetune/lipid_finetune_stage2_run1/checkpoints/" \
-        --model_name "generative_model_ema_best.npy" \
+        --model_path "outputs/stage2_finetune/stage_3/" \
+        --model_name "final_checkpoint_epoch_175.pt" \
         --stats_path "data/lipid_stats.pkl" \
-        --output_path "generated_lipids/lipids_cfg_w5_std2.sdf" \
         --n_samples 1000 \
-        --target_score_std 2.0 \
-        --guidance_scale 5.0 \
-        --batch_size 50
+        --batch_size 50 \
+        --output_path "results/generated_lipids_target12.sdf" \
+        --device "cuda" \
+        --seed 42 \
+        --min_pka 6.0 \
+        --max_pka 8.5 \
+        --min_logp 2.0 \
+        --max_logp 8.0 \
+        --min_mw 400 \
+        --max_mw 800 \
+        --guidance_target_value 12.0
     ```
 *   **Output**: Creates an SDF file (e.g., `generated_lipids/lipids_cfg_w5_std2.sdf`) containing the generated 3D structures.
 
@@ -169,12 +178,11 @@ Follow these steps sequentially.
     *   TransLNP model weights and dictionary (paths specified as arguments).
 *   **Command** (adjust input/output paths, model/dict paths, and filtering/ranking parameters as needed):
     ```bash
-    python evaluate_generated.py \
-        --input_sdf "generated_lipids/lipids_cfg_w5_std2.sdf" \
-        --output_file "generated_lipids/evaluated_lipids_cfg_w5_std2.sdf" \
+    python score_lipids.py \
+        --input_sdf "results/generated_lipids_target12.sdf" \
+        --output_file "results/evaluated_lipids_target12.sdf" \
         --translnp_model "TransLNP/weights/mol_pre_all_h_220816.pt" \
         --translnp_dict "TransLNP/weights/mol.dict.txt" \
-        --filter_smarts "[NX3;H0;!$(*=[!#6]);!$(*[!#6]=[!#6])]" \
         --top_n 20
     ```
 *   **Output**: 
@@ -188,10 +196,8 @@ Follow these steps sequentially.
 *   **`GeoLDM/lipid_dataset.py`**: Defines PyTorch Dataset and DataLoader logic for loading `.pkl` files, handling padding and batching.
 *   **`GeoLDM/stage1_adapt_lipids.py`**: Training script for Stage 1 (unconditional adaptation on unlabeled data).
 *   **`GeoLDM/finetune_lipids.py`**: Training script for Stage 2 (conditional fine-tuning on labeled data).
+*   **`GeoLDM/generate_lipids.py`**: Script for molecule generation
 *   **`GeoLDM/core/`**: Directory containing core model implementations (EGNN, Diffusion), losses, utilities, etc. (Renamed from `qm9`).
 *   **`GeoLDM/configs/`**: Contains dataset configurations (`datasets_config.py`).
 *   **`GeoLDM/eval_sample.py`, `GeoLDM/eval_analyze.py`**: Original evaluation scripts, potentially useful for sampling from the final model and analyzing results (may require adaptation).
 
-## Original GeoLDM Pre-training
-
-The scripts `GeoLDM/main_geom_drugs.py` and `GeoLDM/build_geom_dataset.py` have been retained to allow for potential re-running of the original GEOM-Drugs pre-training if needed. 

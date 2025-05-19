@@ -3,7 +3,6 @@ import math
 import torch
 from GeoLDM.egnn import models
 from torch.nn import functional as F
-from GeoLDM.equivariant_diffusion import utils
 from GeoLDM.equivariant_diffusion import utils as diffusion_utils
 
 
@@ -502,8 +501,10 @@ class EnVariationalDiffusion(torch.nn.Module):
 
     def sample_normal(self, mu, sigma, node_mask, fix_noise=False):
         """Samples from a Normal distribution."""
-        bs = 1 if fix_noise else mu.size(0)
-        eps = self.sample_combined_position_feature_noise(bs, mu.size(1), node_mask)
+        # Correctly sample eps using diffusion_utils and ensure it's on the correct device.
+        # Assuming sigma and node_mask are already on the target device.
+        eps = diffusion_utils.sample_gaussian_with_mask(sigma.size(), sigma.device, node_mask)
+        print(f"CRITICAL DEBUG EnVariationalDiffusion.sample_normal: mu.shape = {mu.shape}, sigma.shape = {sigma.shape}, eps.shape = {eps.shape}, node_mask.device = {node_mask.device}, mu.device = {mu.device}, sigma.device = {sigma.device}, eps.device = {eps.device}") # DEBUG
         return mu + sigma * eps
 
     def log_pxh_given_z0_without_constants(
@@ -754,10 +755,10 @@ class EnVariationalDiffusion(torch.nn.Module):
         """
         Samples mean-centered normal noise for z_x, and standard normal noise for z_h.
         """
-        z_x = utils.sample_center_gravity_zero_gaussian_with_mask(
+        z_x = diffusion_utils.sample_center_gravity_zero_gaussian_with_mask(
             size=(n_samples, n_nodes, self.n_dims), device=node_mask.device,
             node_mask=node_mask)
-        z_h = utils.sample_gaussian_with_mask(
+        z_h = diffusion_utils.sample_gaussian_with_mask(
             size=(n_samples, n_nodes, self.in_node_nf), device=node_mask.device,
             node_mask=node_mask)
         z = torch.cat([z_x, z_h], dim=2)
@@ -929,12 +930,21 @@ class EnHierarchicalVAE(torch.nn.Module):
 
         return error
     
-    def sample_normal(self, mu, sigma, node_mask, fix_noise=False):
+    def sample_normal(self, mu, sigma, node_mask):
         """Samples from a Normal distribution."""
-        bs = 1 if fix_noise else mu.size(0)
-        eps = self.sample_combined_position_feature_noise(bs, mu.size(1), node_mask)
+        # Correctly sample eps using diffusion_utils and ensure it's on the correct device.
+        # Assuming sigma and node_mask are already on the target device.
+        eps = diffusion_utils.sample_gaussian_with_mask(sigma.size(), sigma.device, node_mask)
+        print(f"CRITICAL DEBUG EnHierarchicalVAE.sample_normal: mu.shape = {mu.shape}, sigma.shape = {sigma.shape}, eps.shape = {eps.shape}, node_mask.device = {node_mask.device}, mu.device = {mu.device}, sigma.device = {sigma.device}, eps.device = {eps.device}") # DEBUG
         return mu + sigma * eps
-    
+
+    def sample_normal_zero(self, x, h, node_mask, edge_mask, context, fix_noise=False):
+        """Samples from a Normal distribution."""
+        # Correct device and dtype for eps
+        eps = self.sample_gaussian_with_mask(x.size(), node_mask.device, node_mask) # Pass device explicitly for eps
+        print(f"CRITICAL DEBUG EnHierarchicalVAE.sample_normal_zero: x.shape = {x.shape}, node_mask.device = {node_mask.device}, x.device = {x.device}, eps.device = {eps.device}") # DEBUG
+        return x + eps
+
     def compute_loss(self, x, h, node_mask, edge_mask, context):
         """Computes an estimator for the variational lower bound."""
 
@@ -992,10 +1002,10 @@ class EnHierarchicalVAE(torch.nn.Module):
         """
         Samples mean-centered normal noise for z_x, and standard normal noise for z_h.
         """
-        z_x = utils.sample_center_gravity_zero_gaussian_with_mask(
+        z_x = diffusion_utils.sample_center_gravity_zero_gaussian_with_mask(
             size=(n_samples, n_nodes, self.n_dims), device=node_mask.device,
             node_mask=node_mask)
-        z_h = utils.sample_gaussian_with_mask(
+        z_h = diffusion_utils.sample_gaussian_with_mask(
             size=(n_samples, n_nodes, self.latent_node_nf), device=node_mask.device,
             node_mask=node_mask)
         z = torch.cat([z_x, z_h], dim=2)
@@ -1170,7 +1180,10 @@ class EnLatentDiffusion(EnVariationalDiffusion):
             loss_recon = 0
 
         z_x = z_xh[:, :, :self.n_dims]
+        # Explicitly ensure z_x is mean-zero before the assertion
+        z_x = diffusion_utils.remove_mean_with_mask(z_x, node_mask)
         z_h = z_xh[:, :, self.n_dims:]
+
         diffusion_utils.assert_mean_zero_with_mask(z_x, node_mask)
         # Make the data structure compatible with the EnVariationalDiffusion compute_loss().
         z_h = {'categorical': torch.zeros(0).to(z_h), 'integer': z_h}

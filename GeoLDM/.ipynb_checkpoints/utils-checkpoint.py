@@ -49,7 +49,7 @@ class Queue():
 
 def gradient_clipping(flow, gradnorm_queue):
     # Allow gradient norm to be 150% + 2 * stdev of the recent history.
-    max_grad_norm = 1.5 * gradnorm_queue.mean() + 2 * gradnorm_queue.std()
+    max_grad_norm = 1.1 * gradnorm_queue.mean() + 1 * gradnorm_queue.std()
 
     # Clips gradient and returns the norm
     grad_norm = torch.nn.utils.clip_grad_norm_(

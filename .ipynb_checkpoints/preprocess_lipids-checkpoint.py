@@ -2,269 +2,217 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
+import logging
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from tqdm import tqdm
 
 # --- Configuration ---
-TRAIN_CSV_PATH = "data/train.csv" # Input training CSV file path
-TEST_CSV_PATH = "data/test.csv"   # Input testing CSV file path
-SMILES_COL = "SMILES"             # Column name for SMILES strings
-TARGET_COL = "TARGET"             # Column name for the target property (transfection score)
-CONDITIONING_KEY = "transfection_score" # Key to use for the target property in the output dictionary
+TRAIN_CSV_PATH = "data/train.csv"
+TEST_CSV_PATH = "data/test.csv"
+SMILES_COL = "SMILES"
+TARGET_COL = "TARGET"
+CONDITIONING_KEY = "transfection_score"
 
-OUTPUT_DIR = "data"               # Directory to save processed files
-PROCESSED_TRAIN_PKL = os.path.join(OUTPUT_DIR, "processed_train_lipids.pkl") # Output for processed training data
-PROCESSED_TEST_PKL = os.path.join(OUTPUT_DIR, "processed_test_lipids.pkl")   # Output for processed testing data
-STATS_PKL = os.path.join(OUTPUT_DIR, "lipid_stats.pkl") # Output for dataset statistics (mean, std)
+OUTPUT_DIR = "data"
+PROCESSED_TRAIN_PKL = os.path.join(OUTPUT_DIR, "processed_train_lipids.pkl")
+PROCESSED_TEST_PKL = os.path.join(OUTPUT_DIR, "processed_test_lipids.pkl")
+STATS_PKL = os.path.join(OUTPUT_DIR, "lipid_stats.pkl")
 
-# Define the atom types expected in the dataset (adjust if necessary)
-# This order determines the one-hot encoding index.
-# H, C, N, O are standard; P is common in lipids. F was in QM9 but less likely here.
-# ATOM_DECODER = ['H', 'C', 'N', 'O', 'P'] # Original 5 types
-# New ATOM_DECODER to match geom_with_h from GeoLDM/configs/datasets_config.py
-ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
+ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi']
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
-NUM_ATOM_TYPES = len(ATOM_DECODER) # Should be 16
+NUM_ATOM_TYPES = len(ATOM_DECODER)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+_warned_atom_symbols_csv = set()
 
 # --- Functions ---
 
-def generate_conformer(smiles):
+def generate_conformer_from_smiles(smiles):
     """
-    Generates a 3D conformer for a given SMILES string using RDKit ETKDG.
-    Adds hydrogens and computes Gasteiger charges.
-    Tries fallback methods if ETKDG fails.
-
-    Args:
-        smiles (str): The SMILES string of the molecule.
-
-    Returns:
-        rdkit.Chem.Mol or None: The RDKit molecule object with a 3D conformer and charges,
-                                or None if conformer generation fails.
+    Generates a 3D conformer from SMILES, adds Hs, optimizes, and computes Gasteiger charges.
     """
     try:
-        # Convert SMILES to RDKit molecule object
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
-            print(f"Warning: Could not parse SMILES: {smiles}")
+            logging.warning(f"Could not parse SMILES: {smiles}. Skipping.")
             return None
 
-        # Add hydrogens
-        mol = Chem.AddHs(mol)
+        # logging.info(f"Processing SMILES: {smiles} (Adding Hs)")
+        mol = Chem.AddHs(mol, explicitOnly=False, addCoords=True)
 
-        # --- Attempt 1: ETKDGv3 with seed ---
-        params_seed = AllChem.ETKDGv3()
-        params_seed.randomSeed = 42 # Ensure reproducibility
-        params_seed.useRandomCoords = False # Default ETKDG
-        conf_id = AllChem.EmbedMolecule(mol, params_seed)
+        conf_id = -1
+        # ETKDGv3 parameters for attempts
+        params_list = [AllChem.ETKDGv3() for _ in range(3)]
+        params_list[0].randomSeed = 42
+        params_list[0].useRandomCoords = False
+        params_list[1].useRandomCoords = False # Default seed
+        params_list[2].randomSeed = 42
+        params_list[2].useRandomCoords = True
+        
+        attempt_descs = [
+            "ETKDGv3 (seed 42)",
+            "ETKDGv3 (default seed)",
+            "ETKDGv3 (random coords, seed 42)"
+        ]
 
-        # --- Attempt 2: ETKDGv3 without seed ---
+        for i, params in enumerate(params_list):
+            conf_id = AllChem.EmbedMolecule(mol, params)
+            if conf_id >= 0:
+                # logging.debug(f"Conformer generated with {attempt_descs[i]} for SMILES: {smiles}.")
+                break
+            # else:
+                # logging.warning(f"{attempt_descs[i]} failed for SMILES: {smiles}.")
+
         if conf_id < 0:
-            print(f"Warning: ETKDGv3 (seed 42) failed for SMILES: {smiles}. Trying without seed.")
-            params_no_seed = AllChem.ETKDGv3()
-            params_no_seed.useRandomCoords = False
-            conf_id = AllChem.EmbedMolecule(mol, params_no_seed)
-
-        # --- Attempt 3: ETKDGv3 with random coordinates ---
-        if conf_id < 0:
-            print(f"Warning: ETKDGv3 (no seed) failed for SMILES: {smiles}. Trying with random coords.")
-            params_random = AllChem.ETKDGv3()
-            # Use seed for reproducibility even with random coords
-            params_random.randomSeed = 42
-            params_random.useRandomCoords = True
-            conf_id = AllChem.EmbedMolecule(mol, params_random)
-
-        # --- Check final result --- 
-        if conf_id < 0:
-            print(f"Error: Conformer generation failed for SMILES: {smiles} after all attempts. Skipping.")
+            logging.error(f"Conformer generation failed for SMILES: {smiles} after all attempts. Skipping.")
             return None
-        else:
-            print(f"Success: Conformer generated for SMILES: {smiles} (attempt result code: {conf_id})")
+        # else:
+            # logging.debug(f"Successfully generated conformer for SMILES: {smiles}.")
 
-        # Optimize the geometry using MMFF94 force field
         try:
             opt_result = AllChem.MMFFOptimizeMolecule(mol, confId=conf_id)
-            # Optional: Check opt_result, 0 is success, 1 means optimization failed to converge
             if opt_result != 0:
-                 print(f"Warning: MMFF optimization did not converge (result code {opt_result}) for SMILES: {smiles}. Using best found conformer.")
+                logging.warning(f"MMFF optimization did not converge (code {opt_result}) for SMILES: {smiles}.")
         except Exception as e:
-            # Sometimes optimization can fail, but the embedded conformer might still be usable
-            print(f"Warning: MMFF optimization failed unexpectedly for SMILES: {smiles}. Using unoptimized conformer. Error: {e}")
+            logging.warning(f"MMFF optimization failed for SMILES: {smiles}: {e}.")
 
-
-        # Compute Gasteiger charges (often used in ML models)
         try:
             AllChem.ComputeGasteigerCharges(mol)
         except Exception as e:
-            # Handle potential errors during charge calculation
-            print(f"Warning: Could not compute Gasteiger charges for SMILES: {smiles}. Charges will be set to 0. Error: {e}")
-            # Assign a default charge of 0.0 if calculation fails
+            logging.warning(f"Gasteiger charge computation failed for SMILES: {smiles}: {e}. Charges set to 0.")
             for atom in mol.GetAtoms():
                 atom.SetDoubleProp('_GasteigerCharge', 0.0)
-
-
         return mol
     except Exception as e:
-        print(f"Error processing SMILES {smiles}: {e}")
-        import traceback
-        traceback.print_exc()
+        logging.error(f"General error processing SMILES {smiles}: {e}", exc_info=True)
         return None
 
-def process_molecule(mol, target_score):
+def extract_molecule_features(mol, target_score):
     """
-    Extracts relevant information from an RDKit molecule object for the dataset.
-
-    Args:
-        mol (rdkit.Chem.Mol): The RDKit molecule object with a 3D conformer.
-        target_score (float): The target property value (e.g., transfection score).
-
-    Returns:
-        dict or None: A dictionary containing processed molecule data
-                      ('positions', 'one_hot', 'charges', 'atom_mask', CONDITIONING_KEY),
-                      or None if an atom type is not in ATOM_DECODER.
+    Extracts features from an RDKit molecule with a conformer.
     """
+    global _warned_atom_symbols_csv
+    smiles_for_log = Chem.MolToSmiles(mol) # For logging if name is not available
     try:
-        # Get the conformer
         conformer = mol.GetConformer()
-        positions = conformer.GetPositions() # Get atom coordinates (NumAtoms x 3)
-
+        positions = conformer.GetPositions().astype(np.float32)
         num_atoms = mol.GetNumAtoms()
-        # one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES))
-        # charges = np.zeros((num_atoms, 1))
-        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32) # Will be (num_atoms, 16)
-        
-        # To match GEOM's include_charges=False behavior where charges don't add to feature dim:
-        actual_gasteiger_charges = np.zeros((num_atoms, 1), dtype=np.float32) 
-        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dimensional feature
-        
-        atom_mask = np.ones((num_atoms, 1), dtype=np.float32) # Mask indicating which atoms are real
 
-        # Extract atom features
-        valid_molecule = True
+        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32)
+        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dim for GEOM compatibility
+        atom_mask = np.ones((num_atoms, 1), dtype=np.float32)
+
         for i, atom in enumerate(mol.GetAtoms()):
-            # Get atomic symbol (e.g., 'C', 'H')
             symbol = atom.GetSymbol()
             if symbol not in ATOM_MAP:
-                print(f"Warning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule.")
-                valid_molecule = False
-                break # Stop processing this molecule
-
-            # One-hot encode atom type
+                if symbol not in _warned_atom_symbols_csv:
+                    logging.warning(f"Atom type '{symbol}' not in ATOM_DECODER. Molecules containing it will be skipped. SMILES: {smiles_for_log}")
+                    _warned_atom_symbols_csv.add(symbol)
+                return None
             one_hot[i, ATOM_MAP[symbol]] = 1
+            # Gasteiger charges are on the mol object, not part of 'output_charges_feature' here
 
-            # Get Gasteiger charge (handle potential missing property)
-            charge = atom.GetDoubleProp('_GasteigerCharge') if atom.HasProp('_GasteigerCharge') else 0.0
-            # charges[i, 0] = charge
-            actual_gasteiger_charges[i, 0] = charge # Store calculated Gasteiger charge separately
-
-        if not valid_molecule:
-            return None
-
-        # Prepare data dictionary matching typical GeoLDM input structure
-        data = {
-            'positions': positions.astype(np.float32), # Ensure float32
-            'one_hot': one_hot.astype(np.float32),     # This is (N, 16)
-            # 'charges': charges.astype(np.float32),     # Original
-            'charges': output_charges_feature,          # This is (N, 0)
-            'atom_mask': atom_mask.astype(np.float32), # Ensure float32
-            CONDITIONING_KEY: float(target_score),      # Store the target property
-            # Optionally, we could store the actual Gasteiger charges under a different key if needed for analysis
-            # 'gasteiger_charges_raw': actual_gasteiger_charges 
+        return {
+            'positions': positions,
+            'one_hot': one_hot,
+            'charges': output_charges_feature,
+            'atom_mask': atom_mask,
+            CONDITIONING_KEY: float(target_score) # Ensure target_score is float
         }
-        return data
     except Exception as e:
-        print(f"Error extracting features for a molecule: {e}")
+        logging.error(f"Error extracting features for SMILES {smiles_for_log}: {e}", exc_info=True)
         return None
 
-def preprocess_data(csv_path, output_pkl_path):
+def run_preprocessing_for_csv(csv_path, output_pkl_path):
     """
-    Reads a CSV, generates conformers, processes molecules, and saves to a pickle file.
-
-    Args:
-        csv_path (str): Path to the input CSV file.
-        output_pkl_path (str): Path to save the output pickle file.
-
-    Returns:
-        list: A list of target scores for the processed molecules. Returns empty list on error.
+    Reads CSV, processes molecules, and saves them to a pickle file.
+    Returns a list of target scores for successfully processed molecules.
     """
-    print(f"Processing data from: {csv_path}")
+    logging.info(f"Starting preprocessing for: {csv_path}")
     try:
         df = pd.read_csv(csv_path)
     except FileNotFoundError:
-        print(f"Error: CSV file not found at {csv_path}")
+        logging.error(f"CSV file not found: {csv_path}")
+        return []
+    except Exception as e:
+        logging.error(f"Error reading CSV {csv_path}: {e}", exc_info=True)
         return []
 
     if SMILES_COL not in df.columns or TARGET_COL not in df.columns:
-        print(f"Error: Required columns '{SMILES_COL}' or '{TARGET_COL}' not found in {csv_path}")
+        logging.error(f"Required columns '{SMILES_COL}' or '{TARGET_COL}' not in {csv_path}. Skipping.")
         return []
 
-    processed_molecules = []
-    target_scores = []
+    processed_data_list = []
+    collected_target_scores = []
 
-    # Iterate through the dataframe with progress bar
-    for index, row in tqdm(df.iterrows(), total=df.shape[0], desc=f"Processing {os.path.basename(csv_path)}"):
+    # Create tqdm iterator
+    progress_bar_desc = f"Processing {os.path.basename(csv_path)}"
+    tqdm_iterator = tqdm(df.iterrows(), total=df.shape[0], desc=progress_bar_desc)
+
+    for index, row in tqdm_iterator: # Use the created iterator
         smiles = row[SMILES_COL]
         target_score = row[TARGET_COL]
 
-        # Check for valid SMILES and score
-        if not isinstance(smiles, str) or pd.isna(target_score):
-            print(f"Warning: Skipping row {index+2} due to invalid SMILES or missing target score.")
+        if not isinstance(smiles, str) or pd.isna(smiles) or pd.isna(target_score):
+            # logging.debug(f"Skipping row {index + 2} in {os.path.basename(csv_path)}: invalid SMILES or missing target score.")
             continue
 
-        # Generate 3D conformer
-        mol = generate_conformer(smiles)
-        if mol is None:
-            continue # Skip if conformer generation failed
+        mol_with_conformer = generate_conformer_from_smiles(smiles)
+        if mol_with_conformer is None:
+            continue
 
-        # Extract features
-        molecule_data = process_molecule(mol, target_score)
-        if molecule_data is not None:
-            processed_molecules.append(molecule_data)
-            target_scores.append(target_score) # Collect score for stats calculation
+        features = extract_molecule_features(mol_with_conformer, target_score)
+        if features is not None:
+            processed_data_list.append(features)
+            collected_target_scores.append(float(target_score))
+            # Update tqdm description with the count of successfully processed molecules
+            tqdm_iterator.set_description_str(f"{progress_bar_desc} (Processed: {len(processed_data_list)})")
 
-    # Save the processed data
-    if processed_molecules:
-        print(f"Saving {len(processed_molecules)} processed molecules to {output_pkl_path}")
-        os.makedirs(os.path.dirname(output_pkl_path), exist_ok=True) # Create output directory if needed
-        with open(output_pkl_path, 'wb') as f:
-            pickle.dump(processed_molecules, f)
-        print("Save complete.")
+    if processed_data_list:
+        logging.info(f"Saving {len(processed_data_list)} processed molecules from {os.path.basename(csv_path)} to {output_pkl_path}")
+        try:
+            os.makedirs(os.path.dirname(output_pkl_path), exist_ok=True)
+            with open(output_pkl_path, 'wb') as f:
+                pickle.dump(processed_data_list, f)
+            logging.info(f"Successfully saved {output_pkl_path}")
+        except Exception as e:
+            logging.error(f"Failed to save processed data to {output_pkl_path}: {e}", exc_info=True)
     else:
-        print("No molecules were successfully processed.")
+        logging.info(f"No molecules successfully processed from {os.path.basename(csv_path)}.")
 
-    return target_scores
+    return collected_target_scores
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    print("Starting lipid data preprocessing...")
-    os.makedirs(OUTPUT_DIR, exist_ok=True) # Ensure output directory exists
+def main():
+    logging.info("Starting all lipid data preprocessing (from CSVs)..." )
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Process Training Data
-    train_scores = preprocess_data(TRAIN_CSV_PATH, PROCESSED_TRAIN_PKL)
+    train_target_scores = run_preprocessing_for_csv(TRAIN_CSV_PATH, PROCESSED_TRAIN_PKL)
+    run_preprocessing_for_csv(TEST_CSV_PATH, PROCESSED_TEST_PKL) # Test scores not used for stats
 
-    # Process Testing Data
-    # We don't need test scores for calculating training stats
-    _ = preprocess_data(TEST_CSV_PATH, PROCESSED_TEST_PKL)
+    if train_target_scores:
+        scores_array = np.array(train_target_scores, dtype=np.float64)
+        mean_score = np.mean(scores_array)
+        std_score = np.std(scores_array)
 
-    # Calculate and Save Statistics (using training data only)
-    if train_scores:
-        scores_arr = np.array(train_scores).astype(np.float64) # Use float64 for precision
-        mean_score = np.mean(scores_arr)
-        std_score = np.std(scores_arr)
-
-        # Prevent zero standard deviation
-        if std_score < 1e-8:
-            print(f"Warning: Standard deviation is very low ({std_score}). Setting to 1.0 to avoid division by zero.")
+        if std_score < 1e-8: # Avoid division by zero if all scores are identical
+            logging.warning(f"Standard deviation of target scores is very low ({std_score}). Setting to 1.0 for stats.")
             std_score = 1.0
-
+        
         stats = {'mean': mean_score, 'std': std_score}
-        print(f"Calculated Stats (Training Data): Mean={mean_score:.4f}, Std={std_score:.4f}")
-
-        print(f"Saving statistics to {STATS_PKL}")
-        with open(STATS_PKL, 'wb') as f:
-            pickle.dump(stats, f)
-        print("Save complete.")
+        logging.info(f"Calculated statistics from training data: Mean={mean_score:.4f}, Std={std_score:.4f}")
+        
+        try:
+            with open(STATS_PKL, 'wb') as f:
+                pickle.dump(stats, f)
+            logging.info(f"Successfully saved statistics to {STATS_PKL}")
+        except Exception as e:
+            logging.error(f"Failed to save statistics to {STATS_PKL}: {e}", exc_info=True)
     else:
-        print("Could not calculate statistics because no training molecules were processed.")
+        logging.warning("No training scores collected; statistics cannot be calculated or saved.")
 
-    print("Preprocessing finished.") 
+    logging.info("All lipid preprocessing finished.")
+
+if __name__ == "__main__":
+    main() 

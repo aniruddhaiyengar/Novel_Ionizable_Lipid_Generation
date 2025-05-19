@@ -1,250 +1,180 @@
 import numpy as np
 import pickle
 import os
+import logging # Use logging module for better control
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from tqdm import tqdm
-import sys # For flushing output
 
 # --- Configuration ---
-SDF_PATH = "data/structures.sdf"  # Input SDF file path
-OUTPUT_DIR = "data"               # Directory to save processed file
-PROCESSED_UNLABELED_PKL = os.path.join(OUTPUT_DIR, "processed_unlabeled_lipids.pkl") # Output for processed unlabeled data
-MAX_MOLECULES_TO_PROCESS = 10000  # Stop after processing this many molecules
+SDF_PATH = "data/structures.sdf"
+OUTPUT_DIR = "data"
+PROCESSED_UNLABELED_PKL = os.path.join(OUTPUT_DIR, "processed_unlabeled_lipids.pkl")
+MAX_MOLECULES_TO_PROCESS = 10000
 
-# Define the atom types expected in the dataset (ensure consistency with other scripts)
-# ATOM_DECODER = ['H', 'C', 'N', 'O', 'P'] # Original 5 types
-# New ATOM_DECODER to match geom_with_h from GeoLDM/configs/datasets_config.py
-ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi'] # 16 types
+ATOM_DECODER = ['H', 'B', 'C', 'N', 'O', 'F', 'Al', 'Si', 'P', 'S', 'Cl', 'As', 'Br', 'I', 'Hg', 'Bi']
 ATOM_MAP = {symbol: i for i, symbol in enumerate(ATOM_DECODER)}
-NUM_ATOM_TYPES = len(ATOM_DECODER) # Should be 16
+NUM_ATOM_TYPES = len(ATOM_DECODER)
 
-# --- Functions (Adapted from preprocess_lipids.py) ---
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Keep track of symbols that caused warnings to avoid flooding logs
+_warned_atom_symbols = set()
 
-def generate_conformer_from_mol(mol):
+
+def generate_conformer(mol):
     """
-    Adds hydrogens, generates a 3D conformer, optimizes, and computes Gasteiger charges
-    for a given RDKit molecule object (potentially read from SDF).
-    Tries fallback methods if ETKDG fails.
-
-    Args:
-        mol (rdkit.Chem.Mol): The RDKit molecule object.
-
-    Returns:
-        rdkit.Chem.Mol or None: The RDKit molecule object with added Hs, 3D conformer, and charges,
-                                or None if processing fails.
+    Adds hydrogens, generates a 3D conformer, optimizes, and computes Gasteiger charges.
     """
-    try:
-        if mol is None:
-            return None
+    mol_name = mol.GetProp("_Name") if mol.HasProp("_Name") else "unknown_molecule"
+    # logging.info(f"Processing: {mol_name} (Adding Hs)")
+    mol = Chem.AddHs(mol, explicitOnly=False, addCoords=True)
 
-        # Get name for logging if available
-        mol_name = mol.GetProp("_Name") if mol.HasProp("_Name") else "unknown_molecule"
-
-        # Add hydrogens (important for accurate charges and geometry)
-        mol = Chem.AddHs(mol, addCoords=True) # addCoords helps if input had some 3D info
-
-        conf_id = -1
-        # Try using existing conformer first if available from SDF
-        if mol.GetNumConformers() > 0:
-            conf_id = 0
-            print(f"Info: Using existing conformer for {mol_name}.")
-        else:
-            # --- Attempt 1: ETKDGv3 with seed ---
-            print(f"Info: Attempting ETKDGv3 (seed 42) for {mol_name}.")
-            params_seed = AllChem.ETKDGv3()
-            params_seed.randomSeed = 42
-            params_seed.useRandomCoords = False
-            conf_id = AllChem.EmbedMolecule(mol, params_seed)
-
-            # --- Attempt 2: ETKDGv3 without seed ---
-            if conf_id < 0:
-                print(f"Warning: ETKDGv3 (seed 42) failed for {mol_name}. Trying without seed.")
-                params_no_seed = AllChem.ETKDGv3()
-                params_no_seed.useRandomCoords = False
-                conf_id = AllChem.EmbedMolecule(mol, params_no_seed)
-
-            # --- Attempt 3: ETKDGv3 with random coordinates ---
-            if conf_id < 0:
-                print(f"Warning: ETKDGv3 (no seed) failed for {mol_name}. Trying with random coords.")
-                params_random = AllChem.ETKDGv3()
-                params_random.randomSeed = 42 # Keep seed for reproducibility
-                params_random.useRandomCoords = True
-                conf_id = AllChem.EmbedMolecule(mol, params_random)
-
-        # --- Check final result --- 
-        if conf_id < 0:
-            print(f"Error: Conformer generation failed for {mol_name} after all attempts. Skipping.")
-            return None
-        else:
-            # Only print success if we had to generate it
-            if mol.GetNumConformers() == 0: # Check if we actually generated one vs used existing
-                 print(f"Success: Conformer generated for {mol_name} (attempt result code: {conf_id})")
-
-
-        # Optimize the geometry using MMFF94 force field
-        try:
-            opt_result = AllChem.MMFFOptimizeMolecule(mol, confId=conf_id)
-            if opt_result != 0:
-                 print(f"Warning: MMFF optimization did not converge (result code {opt_result}) for {mol_name}. Using best found conformer.")
-        except Exception as e:
-            # Sometimes optimization can fail
-            print(f"Warning: MMFF optimization failed unexpectedly for {mol_name}. Using unoptimized conformer. Error: {e}")
-
-
-        # Compute Gasteiger charges
-        try:
-            AllChem.ComputeGasteigerCharges(mol)
-        except Exception as e:
-            print(f"Warning: Could not compute Gasteiger charges for {mol_name}. Charges will be set to 0. Error: {e}")
-            # Assign a default charge of 0.0 if calculation fails
-            for atom in mol.GetAtoms():
-                atom.SetDoubleProp('_GasteigerCharge', 0.0)
-
-        return mol
-    except Exception as e:
-        print(f"Error processing a molecule from SDF: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-def process_molecule(mol):
-    """
-    Extracts relevant information from an RDKit molecule object for the dataset.
-    (Modified to not require target_score).
-
-    Args:
-        mol (rdkit.Chem.Mol): The RDKit molecule object with a 3D conformer.
-
-    Returns:
-        dict or None: A dictionary containing processed molecule data
-                      ('positions', 'one_hot', 'charges', 'atom_mask'),
-                      or None if an atom type is not in ATOM_DECODER or other error.
-    """
-    try:
-        # Get the conformer (assuming one exists after generate_conformer_from_mol)
-        conformer = mol.GetConformer()
-        positions = conformer.GetPositions() # Get atom coordinates (NumAtoms x 3)
-
-        num_atoms = mol.GetNumAtoms()
-        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32) # Will be (num_atoms, 16)
-        # charges = np.zeros((num_atoms, 1)) # Original: Gasteiger charge as 1 feature
+    conf_id = -1
+    if mol.GetNumConformers() > 0:
+        conf_id = 0 # Use existing conformer
+        # logging.debug(f"Using existing conformer for {mol_name}.")
+    else:
+        # logging.debug(f"Attempting conformer generation for {mol_name}.")
+        params = [AllChem.ETKDGv3() for _ in range(3)]
+        params[0].randomSeed = 42
+        params[0].useRandomCoords = False
+        params[1].useRandomCoords = False # Default seed
+        params[2].randomSeed = 42
+        params[2].useRandomCoords = True
         
-        # To match GEOM's include_charges=False behavior where charges don't add to feature dim:
-        # We'll still calculate Gasteiger for potential future use or inspection,
-        # but the 'charges' field in the output dict will be 0-dimensional.
-        actual_gasteiger_charges = np.zeros((num_atoms, 1), dtype=np.float32) 
-        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32) # 0-dimensional feature
+        attempt_descs = [
+            "ETKDGv3 (seed 42)",
+            "ETKDGv3 (default seed)",
+            "ETKDGv3 (random coords, seed 42)"
+        ]
 
-        atom_mask = np.ones((num_atoms, 1), dtype=np.float32) # Mask indicating which atoms are real
+        for i, p in enumerate(params):
+            conf_id = AllChem.EmbedMolecule(mol, p)
+            if conf_id >= 0:
+                # logging.debug(f"Conformer generated with {attempt_descs[i]} for {mol_name}.")
+                break
+            # else:
+                # logging.warning(f"{attempt_descs[i]} failed for {mol_name}.")
+        
+        if conf_id < 0:
+            logging.error(f"Conformer generation failed for {mol_name} after all attempts. Skipping.")
+            return None
 
-        # Extract atom features
-        valid_molecule = True
+    try:
+        opt_result = AllChem.MMFFOptimizeMolecule(mol, confId=conf_id)
+        if opt_result != 0:
+            logging.warning(f"MMFF optimization did not converge (code {opt_result}) for {mol_name}. Using best found conformer.")
+    except Exception as e:
+        logging.warning(f"MMFF optimization failed for {mol_name}: {e}. Using unoptimized conformer.")
+
+    try:
+        AllChem.ComputeGasteigerCharges(mol)
+    except Exception as e:
+        logging.warning(f"Gasteiger charge computation failed for {mol_name}: {e}. Charges set to 0.")
+        for atom in mol.GetAtoms():
+            atom.SetDoubleProp('_GasteigerCharge', 0.0)
+    return mol
+
+def extract_molecule_features(mol):
+    """
+    Extracts positions, one-hot encoding, charges, and atom_mask from an RDKit molecule.
+    """
+    global _warned_atom_symbols
+    mol_name = mol.GetProp("_Name") if mol.HasProp("_Name") else "unknown_in_extract"
+    try:
+        conformer = mol.GetConformer() # Assumes conformer_id=0 is the one we want if multiple exist
+        positions = conformer.GetPositions().astype(np.float32)
+        num_atoms = mol.GetNumAtoms()
+
+        # logging.debug(f"Extracting features for {mol_name}: NumAtoms={num_atoms}, Positions Shape={positions.shape}")
+
+
+        one_hot = np.zeros((num_atoms, NUM_ATOM_TYPES), dtype=np.float32)
+        # Charges are 0-dimensional feature vector to match GEOM non-charged features
+        # Gasteiger charges are computed on mol object but not directly part of 'charges' unless modified
+        output_charges_feature = np.zeros((num_atoms, 0), dtype=np.float32)
+        atom_mask = np.ones((num_atoms, 1), dtype=np.float32)
+
         for i, atom in enumerate(mol.GetAtoms()):
-            # Get atomic symbol
             symbol = atom.GetSymbol()
             if symbol not in ATOM_MAP:
-                # Print only once per run for a given symbol to avoid flooding
-                if not hasattr(process_molecule, "warned_symbols"):
-                    process_molecule.warned_symbols = set()
-                if symbol not in process_molecule.warned_symbols:
-                    print(f"\nWarning: Atom type '{symbol}' not in ATOM_DECODER {ATOM_DECODER}. Skipping molecule(s) with this atom type.")
-                    process_molecule.warned_symbols.add(symbol)
-                valid_molecule = False
-                break # Stop processing this molecule
-
-            # One-hot encode atom type
+                if symbol not in _warned_atom_symbols:
+                    logging.warning(f"Atom type '{symbol}' not in ATOM_DECODER. Molecules with this atom type will be skipped. Molecule: {mol_name}")
+                    _warned_atom_symbols.add(symbol)
+                return None
             one_hot[i, ATOM_MAP[symbol]] = 1
+            # Gasteiger charge is on atom object, not added to 'output_charges_feature' here
 
-            # Get Gasteiger charge
-            charge = atom.GetDoubleProp('_GasteigerCharge') if atom.HasProp('_GasteigerCharge') else 0.0
-            # charges[i, 0] = charge # Store in original charges array
-            actual_gasteiger_charges[i, 0] = charge # Store calculated Gasteiger charge separately
-
-        if not valid_molecule:
-            return None
-
-        # Prepare data dictionary
-        data = {
-            'positions': positions.astype(np.float32),
-            'one_hot': one_hot.astype(np.float32), # This is (N, 16)
-            # 'charges': charges.astype(np.float32), # Original
-            'charges': output_charges_feature, # This is (N, 0)
-            'atom_mask': atom_mask.astype(np.float32)
-            # No conditioning key needed here
-            # Optionally, we could store the actual Gasteiger charges under a different key if needed for analysis
-            # 'gasteiger_charges_raw': actual_gasteiger_charges 
+        return {
+            'positions': positions,
+            'one_hot': one_hot,
+            'charges': output_charges_feature,
+            'atom_mask': atom_mask
         }
-        return data
-    except AttributeError:
-        # Likely error if conformer doesn't exist or GetPositions fails
-        print("\nError: Failed to get conformer or positions for a molecule. Skipping.")
-        return None
     except Exception as e:
-        print(f"\nError extracting features for a molecule: {e}")
+        logging.error(f"Error extracting features for {mol_name}: {e}", exc_info=True)
         return None
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    print("Starting unlabeled lipid data preprocessing from SDF...")
-    os.makedirs(OUTPUT_DIR, exist_ok=True) # Ensure output directory exists
+def main():
+    logging.info("Starting unlabeled lipid data preprocessing from SDF...")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    processed_molecules = []
-
-    print(f"Reading molecules from: {SDF_PATH}")
-    # Use SDMolSupplier to read molecules iteratively from SDF
-    suppl = Chem.SDMolSupplier(SDF_PATH)
-
-    # Iterate through molecules using tqdm for progress bar
-    # We don't know the total easily, so the progress bar won't show total percentage
-    mol_iterator = tqdm(suppl, desc=f"Processing {os.path.basename(SDF_PATH)}")
+    processed_molecules_data = []
+    
+    logging.info(f"Reading molecules from: {SDF_PATH}")
+    # removeHs=False, sanitize=True are defaults and generally good.
+    suppl = Chem.SDMolSupplier(SDF_PATH, removeHs=False, sanitize=True)
 
     processed_count = 0
     skipped_count = 0
-    total_read = 0 # Keep track of how many were read from SDF
+    total_read = 0
 
-    for i, mol in enumerate(mol_iterator):
-        total_read = i + 1
-        if mol is None:
+    # Iterating with tqdm
+    # Since total number of molecules in SDF is unknown, progress bar won't show total
+    # mol_iterator = tqdm(suppl, desc=f"Processing {os.path.basename(SDF_PATH)}", unit="mol")
+
+    for i, mol_initial in enumerate(suppl):
+        total_read += 1
+        if mol_initial is None:
+            # logging.warning(f"Molecule at SDF index {i} could not be read by RDKit.")
             skipped_count += 1
             continue
 
-        # Generate conformer, add Hs, compute charges
-        processed_mol = generate_conformer_from_mol(mol)
-        if processed_mol is None:
+        mol_with_conformer = generate_conformer(mol_initial)
+        if mol_with_conformer is None:
             skipped_count += 1
-            continue # Skip if conformer generation/processing failed
+            continue
 
-        # Extract features
-        molecule_data = process_molecule(processed_mol)
-        if molecule_data is not None:
-            processed_molecules.append(molecule_data)
+        features = extract_molecule_features(mol_with_conformer)
+        if features is not None:
+            processed_molecules_data.append(features)
             processed_count += 1
         else:
             skipped_count += 1
+        
+        if total_read % 500 == 0: # Log progress every 500 molecules
+             logging.info(f"Progress: Read {total_read}, Processed {processed_count}, Skipped {skipped_count}")
 
-        # Update tqdm description periodically
-        if total_read % 100 == 0:
-             mol_iterator.set_postfix({"Read": total_read, "Processed": processed_count, "Skipped": skipped_count})
-
-        # Check if we have reached the desired number of processed molecules
         if processed_count >= MAX_MOLECULES_TO_PROCESS:
-            print(f"\nReached limit of {MAX_MOLECULES_TO_PROCESS} successfully processed molecules. Stopping SDF processing.")
-            break # Exit the loop
+            logging.info(f"Reached limit of {MAX_MOLECULES_TO_PROCESS} successfully processed molecules.")
+            break
+    
+    # mol_iterator.close()
+    logging.info(f"Finished SDF processing. Total attempted: {total_read}, Successfully processed: {processed_count}, Skipped: {skipped_count}")
 
-    # Final update for tqdm after loop finishes or breaks
-    mol_iterator.set_postfix({"Read": total_read, "Processed": processed_count, "Skipped": skipped_count})
-    mol_iterator.close() # Close the tqdm bar cleanly
-    print(f"\nFinished reading SDF. Total attempted: {total_read}, Successfully processed: {processed_count}, Skipped: {skipped_count}")
-
-
-    # Save the processed data
-    if processed_molecules:
-        print(f"Saving {len(processed_molecules)} processed unlabeled molecules (up to limit) to {PROCESSED_UNLABELED_PKL}")
-        with open(PROCESSED_UNLABELED_PKL, 'wb') as f:
-            pickle.dump(processed_molecules, f)
-        print("Save complete.")
+    if processed_molecules_data:
+        logging.info(f"Saving {len(processed_molecules_data)} processed molecules to {PROCESSED_UNLABELED_PKL}")
+        try:
+            with open(PROCESSED_UNLABELED_PKL, 'wb') as f:
+                pickle.dump(processed_molecules_data, f)
+            logging.info("Save complete.")
+        except Exception as e:
+            logging.error(f"Failed to save processed data: {e}", exc_info=True)
     else:
-        print("No molecules were successfully processed from the SDF file.")
+        logging.info("No molecules were successfully processed to save.")
 
-    print("Unlabeled preprocessing finished.") 
+    logging.info("Unlabeled preprocessing finished.")
+
+if __name__ == "__main__":
+    main() 

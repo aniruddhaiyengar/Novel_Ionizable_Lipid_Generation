@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/aa5479/miniconda3/envs/myenv/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/aa5479/miniconda3/envs/myenv/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/aa5479/Novel_Ionizable_Lipid_Generation/GeoLDM/finetune_lipids.py", line 48, in <module>
+    from rdkit.Chem import SAscore # Added for synthesizability
+ImportError: cannot import name 'SAscore' from 'rdkit.Chem' (/home/aa5479/miniconda3/envs/myenv/lib/python3.10/site-packages/rdkit/Chem/__init__.py)

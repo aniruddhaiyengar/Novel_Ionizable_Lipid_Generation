@@ -1,53 +1,85 @@
 '''
-Stage 1 Adaptation Script: Fine-tuning GeoLDM on unlabeled lipid data.
+Stage 1 Adaptation Script: Fine-tuning GeoLDM on Unlabeled Lipid Data.
 
-Adapts a pre-trained GeoLDM model (e.g., from GEOM-Drugs) to the general
-chemical space of a target lipid dataset provided via an SDF file (preprocessed).
-This script performs UNCONDITIONAL training.
+This script adapts a pre-trained GeoLDM model (e.g., from GEOM-Drugs) to the
+chemical space of a target lipid dataset. The lipid data is provided as a
+preprocessed PKL file containing molecular conformers and features. This stage
+performs unconditional training on the unlabeled lipid data, primarily focusing
+on adapting the diffusion model's dynamics.
 
-Based on finetune_lipids.py
+Key Operations:
+1.  Loads command-line arguments and arguments from a pre-trained model.
+2.  Initializes logging (console and optional file) and Weights & Biases (WandB).
+3.  Loads the unlabeled lipid dataset and computes necessary statistics (n_nodes histogram,
+    feature normalization).
+4.  Builds the generative model (Latent Diffusion Model with a VAE).
+    - Initializes potentially problematic layers conservatively.
+    - Loads pre-trained weights, skipping mismatched layers.
+    - Configures layer freezing: VAE is frozen, dynamics model is fully unfrozen.
+    - LSUV initialization is SKIPPED in this stage.
+5.  Sets up the optimizer and Exponential Moving Average (EMA).
+6.  Runs the training loop:
+    - Iterates through epochs and batches.
+    - Computes loss (NLL + ODE regularization).
+    - Performs backpropagation and optimizer steps.
+    - Optionally applies gradient clipping and EMA updates.
+    - Logs training metrics to console and WandB.
+7.  Periodically validates the model on a validation split and saves checkpoints
+    (best and final).
 '''
 
-from rdkit import Chem
-import logging
 import sys
-
-
-# Local imports
-import GeoLDM.lipid_dataset as lipid_dataset
-from GeoLDM.configs.datasets_config import get_dataset_info
-
-
-# Original GeoLDM imports
-import copy
-import GeoLDM.utils as utils
-import argparse
-import wandb
 import os
-from os.path import join
-from GeoLDM.core.models import get_optim, get_latent_diffusion
-from GeoLDM.equivariant_diffusion import en_diffusion
-from GeoLDM.equivariant_diffusion import utils as diffusion_utils
-from GeoLDM.core import losses as qm9_losses
-import torch
-import time
+
+# Add the parent directory (project root) to sys.path to allow absolute imports
+# This ensures that GeoLDM modules can be imported correctly.
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+import logging
+import argparse
 import pickle
-from tqdm import tqdm
-import numpy as np
-import random
+import time
+from os.path import join
 from pathlib import Path
 from collections import Counter
-import math # Added for math.sqrt
+import copy
 
-# --- LSUV Global and Helper Functions (NEW - PLACED AT TOP) ---
-captured_output_lsuv = None
+import torch
+import numpy as np
+import wandb
+from tqdm import tqdm
 
-def hook_fn_lsuv(module, input, output):
-    global captured_output_lsuv
-    captured_output_lsuv = output
+# Local GeoLDM imports
+from GeoLDM import utils as project_utils # Renamed to avoid conflict with diffusion_utils
+from GeoLDM import lipid_dataset
+from GeoLDM.configs.datasets_config import get_dataset_info
+from GeoLDM.core.models import get_optim, get_latent_diffusion
+from GeoLDM.equivariant_diffusion import utils as diffusion_utils
+from GeoLDM.core import losses as qm9_losses
 
-def get_layer_by_path(model, path_str):
-    obj = model
+# --- Constants ---
+DEFAULT_WANDB_PROJECT = "e3_diffusion_lipid_adapt_stage1"
+DEFAULT_EXP_NAME = "geoldm_lipid_adapt_stage1"
+PRETRAINED_ARGS_FILENAME = "args.pickle"
+DEFAULT_MODEL_FILENAME = "generative_model_ema.npy"
+
+
+# --- Utility Functions ---
+def _get_module_by_path(model_obj: torch.nn.Module, path_str: str) -> torch.nn.Module | None:
+    """
+    Retrieve a PyTorch module from a model using a dot-separated path string.
+
+    Args:
+        model_obj: The parent PyTorch model.
+        path_str: Dot-separated path to the target module (e.g., "dynamics.egnn.embedding").
+
+    Returns:
+        The PyTorch module if found, otherwise None.
+    """
+    obj = model_obj
     for part in path_str.split('.'):
         if hasattr(obj, part):
             obj = getattr(obj, part)
@@ -55,1025 +87,875 @@ def get_layer_by_path(model, path_str):
             try:
                 obj = obj[int(part)]
             except IndexError:
-                logging.error(f"IndexError getting layer part {part} in {path_str}")
+                logging.error(f"IndexError getting module part '{part}' in path '{path_str}'")
                 return None
         else:
-            logging.error(f"Could not get layer part {part} in {path_str}")
+            logging.warning(f"Could not get module part '{part}' in path '{path_str}' from object of type {type(obj)}")
             return None
     return obj
 
-def lsuv_initialize_modules(model, module_paths, sample_batch_data, args_obj, device, dtype,
-                           target_std=0.05, target_mean=0.0, iterations=10, tolerance=0.01,
-                           is_stage2_run=False):
-    logging.info(f"Starting LSUV init for {len(module_paths)} modules (is_stage2_run: {is_stage2_run}), target_std={target_std}, target_mean={target_mean}")
-    global captured_output_lsuv
 
-    # Get all suitable modules for LSUV initialization
-    modules = get_lsuv_modules(model, module_paths)
-    logging.info(f"Found {len(modules)} suitable modules for LSUV initialization")
+# --- Argument Parsing ---
+def _add_general_args(parser: argparse.ArgumentParser):
+    '''Adds general arguments for experiment setup and logging.'''
+    parser.add_argument('--log_file', type=str, default=None,
+                        help="Path to save log file. If None, logs to console.")
+    parser.add_argument('--exp_name', type=str, default=DEFAULT_EXP_NAME,
+                        help="Experiment name for logging and output directories.")
+    parser.add_argument('--output_dir', type=str, default='outputs',
+                        help="Base directory to save outputs and checkpoints.")
+    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument('--no_cuda', action='store_true', default=False, help="Disable CUDA, run on CPU.")
 
-    # Initialize max deviation variables
-    max_mean_deviation_from_target = 0.0
-    max_std_deviation_from_target = 0.0
 
-    # --- Prepare sample batch data (x, h) ---
-    x_sample_raw = sample_batch_data['positions'].to(device, dtype)
-    one_hot_sample_raw = sample_batch_data['one_hot'].to(device, dtype)
-    charges_sample_raw = sample_batch_data['charges'].to(device, dtype)
-    node_mask_sample = sample_batch_data['atom_mask'].to(device, dtype)
-    edge_mask_sample = sample_batch_data['edge_mask'].to(device, dtype)
+def _add_data_args(parser: argparse.ArgumentParser):
+    '''Adds arguments related to data loading and preprocessing.'''
+    parser.add_argument('--unlabeled_data_path', type=str, required=True,
+                        help="Path to processed UNLABELED lipid data (e.g., processed_unlabeled_lipids.pkl).")
+    parser.add_argument('--num_workers', type=int, default=0, help="Number of workers for DataLoader.")
+    parser.add_argument('--val_split_ratio', type=float, default=0.01,
+                        help="Fraction of unlabeled data to use for validation.")
 
-    if node_mask_sample.ndim == 2:
-        node_mask_sample = node_mask_sample.unsqueeze(-1)
 
-    x_mean_attr = 'stage2_dataset_x_mean' if is_stage2_run else 'dataset_x_mean'
-    x_std_attr = 'stage2_dataset_x_std' if is_stage2_run else 'dataset_x_std'
-    h_cat_mean_attr = 'stage2_dataset_h_cat_mean' if is_stage2_run else 'dataset_h_cat_mean'
-    h_cat_std_attr = 'stage2_dataset_h_cat_std' if is_stage2_run else 'dataset_h_cat_std'
+def _add_model_loading_args(parser: argparse.ArgumentParser):
+    '''Adds arguments for loading the pretrained model.'''
+    parser.add_argument('--pretrained_path', type=str, required=True,
+                        help=f"Path to the folder containing pretrained model state and '{PRETRAINED_ARGS_FILENAME}'.")
+    parser.add_argument('--model_name', type=str, default=DEFAULT_MODEL_FILENAME,
+                        help="Name of the model state_dict file to load from pretrained_path.")
 
-    # Initialize normalized tensors
-    x_sample_normalized = x_sample_raw
-    one_hot_sample_normalized = one_hot_sample_raw
 
-    # Apply normalization if stats are available
-    if hasattr(args_obj, x_mean_attr) and getattr(args_obj, x_mean_attr) is not None:
-        dataset_x_mean_dev = getattr(args_obj, x_mean_attr).to(device)
-        dataset_x_std_dev = getattr(args_obj, x_std_attr).to(device)
-        x_sample_normalized = (x_sample_raw - dataset_x_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_x_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
+def _add_training_args(parser: argparse.ArgumentParser):
+    '''Adds arguments specific to the training/adaptation process.'''
+    parser.add_argument('--n_epochs', type=int, default=50, help="Number of adaptation epochs.")
+    parser.add_argument('--batch_size', type=int, default=32, help="Batch size for training.")
+    parser.add_argument('--lr', type=float, default=1e-5, help="Learning rate for the optimizer.")
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help="Exponential Moving Average decay rate (0 to disable EMA).")
+    parser.add_argument('--test_epochs', type=int, default=5, help="Run validation every N epochs.")
+    parser.add_argument('--save_model', type=eval, default=True, choices=[True, False],
+                        help="Whether to save model checkpoints.")
+    parser.add_argument('--clip_grad', type=eval, default=True, choices=[True, False],
+                        help="Whether to enable gradient clipping.")
+    parser.add_argument('--clip_value', type=float, default=1.0, help="Value for gradient clipping if enabled.")
+    parser.add_argument('--n_report_steps', type=int, default=50,
+                        help="Log training progress every N steps within an epoch.")
+    parser.add_argument('--ode_regularization', type=float, default=1e-3, help="Weight for ODE regularization term.")
+
+
+def _add_wandb_args(parser: argparse.ArgumentParser):
+    '''Adds arguments for Weights & Biases integration.'''
+    parser.add_argument('--no_wandb', action='store_true', help="Disable WandB logging.")
+    parser.add_argument('--wandb_usr', type=str, default=None, help="WandB username or entity.")
+    parser.add_argument('--wandb_project', type=str, default=DEFAULT_WANDB_PROJECT,
+                        help="WandB project name.")
+    parser.add_argument('--online', type=eval, default=True, choices=[True, False],
+                        help="WandB online mode (True) or offline mode (False).")
+
+
+def _add_configurable_model_args(parser: argparse.ArgumentParser):
+    '''
+    Adds model architecture and diffusion process arguments that can be
+    loaded from a pretrained model's args.pickle or overridden by command line.
+    Defaults are provided here.
+    '''
+    # Base dataset configuration
+    parser.add_argument('--dataset', type=str, default='geom',
+                        help="Base dataset type used for pretraining (e.g., 'geom', 'qm9'). Affects atom decoders.")
+    parser.add_argument('--remove_h', action='store_true', help="If true, uses dataset config without hydrogens.")
+
+    # Core Model Architecture
+    parser.add_argument('--model', type=str, default='egnn_dynamics', help="Core model type (e.g., 'egnn_dynamics').")
+    parser.add_argument('--n_layers', type=int, default=4, help="Number of EGNN layers in the dynamics model.")
+    parser.add_argument('--nf', type=int, default=256, help="Number of features for hidden layers.")
+    parser.add_argument('--latent_nf', type=int, default=2,
+                        help="Number of latent features for the VAE. Critical for checkpoint compatibility.")
+    parser.add_argument('--tanh', type=eval, default=True, choices=[True, False], help="Whether to use tanh activation in EGNN.")
+    parser.add_argument('--attention', type=eval, default=True, choices=[True, False], help="Whether to use attention in EGNN.")
+    parser.add_argument('--norm_constant', type=float, default=1.0, help="Normalization constant for EGNN.")
+    parser.add_argument('--inv_sublayers', type=int, default=1, help="Number of invariant sublayers in EGNN.")
+    parser.add_argument('--sin_embedding', type=eval, default=False, choices=[True, False],
+                        help="Whether to use sinusoidal embeddings.")
+    parser.add_argument('--include_charges', type=eval, default=True, choices=[True, False],
+                        help="Whether to include atomic charges as a feature.")
+    parser.add_argument('--normalization_factor', type=float, default=1.0, help="General normalization factor.")
+    parser.add_argument('--aggregation_method', type=str, default='sum', help="Aggregation method in EGNN (e.g., 'sum').")
+
+    # Diffusion Process
+    parser.add_argument('--diffusion_steps', type=int, default=1000, help="Number of diffusion timesteps.")
+    parser.add_argument('--diffusion_noise_schedule', type=str, default='polynomial_2',
+                        help="Noise schedule for diffusion (e.g., 'polynomial_2', 'cosine').")
+    parser.add_argument('--diffusion_loss_type', type=str, default='l2', help="Loss type for diffusion (e.g., 'l2', 'vlb').")
+    parser.add_argument('--diffusion_noise_precision', type=float, default=1e-5, help="Precision for noise schedule.")
+
+    # VAE / Latent Diffusion Specific
+    parser.add_argument('--kl_weight', type=float, default=0.01, help="Weight for KL divergence term in VAE loss.")
+    # For Stage 1, train_diffusion is effectively True for the dynamics model.
+    # trainable_ae and condition_time are handled via command-line overrides below.
+    parser.add_argument('--train_diffusion', type=eval, default=True, choices=[True, False],
+                        help="Whether the diffusion process itself is trained (should be True for adaptation).")
+    parser.add_argument('--normalize_factors', type=lambda s: [float(item) for item in s.split(',')],
+                        default="1.0,1.0,1.0", help="Comma-separated list of normalization factors (e.g., '1,4,10').")
+
+    # Command-line flags for specific overrides of boolean args from pickle
+    # VAE trainability is False by default for Stage 1 unless overridden by pickle and not by command line.
+    parser.add_argument('--trainable_ae_cmd', dest='trainable_ae_cmd', action='store_true', default=None,
+                        help="Command-line override to set trainable_ae to True.")
+    parser.add_argument('--no-trainable_ae_cmd', dest='trainable_ae_cmd', action='store_false',
+                        help="Command-line override to set trainable_ae to False.")
+    # Dynamics model conditioning on time (typically False for unconditional Stage 1 from pretrained GeoLDM)
+    parser.add_argument('--condition_time_cmd', dest='condition_time_cmd', action='store_true', default=None,
+                        help="Command-line override to set condition_time to True.")
+    parser.add_argument('--no-condition_time_cmd', dest='condition_time_cmd', action='store_false',
+                        help="Command-line override to set condition_time to False.")
+
+
+def _create_arg_parser() -> argparse.ArgumentParser:
+    '''Creates and returns the ArgumentParser for the script, adding all argument groups.'''
+    parser = argparse.ArgumentParser(description="GeoLDM Lipid Adaptation (Stage 1 - Unlabeled Data)")
+    _add_general_args(parser)
+    _add_data_args(parser)
+    _add_model_loading_args(parser)
+    _add_training_args(parser)
+    _add_wandb_args(parser)
+    _add_configurable_model_args(parser)
+    return parser
+
+
+def _finalize_args(args: argparse.Namespace, loaded_pretrained_args: argparse.Namespace | None):
+    '''
+    Finalizes arguments after loading from pretrained model and command line.
+    Handles overrides and sets fixed configurations for Stage 1.
+    '''
+    # Reconcile trainable_ae: Command line > Pickle > Default (False for Stage 1)
+    pickle_trainable_ae = getattr(loaded_pretrained_args, 'trainable_ae', False)
+    if args.trainable_ae_cmd is not None:
+        args.trainable_ae = args.trainable_ae_cmd
+        logging.info(f"'trainable_ae' set to {args.trainable_ae} by command-line argument.")
     else:
-        logging.warning(f"LSUV: Dataset x mean/std not found in args_obj ({x_mean_attr}). Using raw positions.")
+        args.trainable_ae = pickle_trainable_ae
+        logging.info(f"'trainable_ae' set to {args.trainable_ae} from pickle/default (no command-line override).")
+    # Ensure it's False for Stage 1 as intended by current adaptation strategy
+    if args.trainable_ae:
+        logging.warning("Stage 1 typically keeps VAE frozen. Overriding args.trainable_ae to False.")
+        args.trainable_ae = False
 
-    if hasattr(args_obj, h_cat_mean_attr) and getattr(args_obj, h_cat_mean_attr) is not None:
-        dataset_h_cat_mean_dev = getattr(args_obj, h_cat_mean_attr).to(device)
-        dataset_h_cat_std_dev = getattr(args_obj, h_cat_std_attr).to(device)
-        one_hot_sample_normalized = (one_hot_sample_raw - dataset_h_cat_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_h_cat_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
+    # Reconcile condition_time: Command line > Pickle > Default (False for unconditional Stage 1)
+    pickle_condition_time = getattr(loaded_pretrained_args, 'condition_time', False)
+    if args.condition_time_cmd is not None:
+        args.condition_time = args.condition_time_cmd
+        logging.info(f"'condition_time' set to {args.condition_time} by command-line argument.")
     else:
-        logging.warning(f"LSUV: Dataset h_cat mean/std not found in args_obj ({h_cat_mean_attr}). Using raw one_hot features.")
+        args.condition_time = pickle_condition_time
+        logging.info(f"'condition_time' set to {args.condition_time} from pickle/default (no command-line override).")
+    # Ensure it's False for Stage 1 (unconditional generation)
+    if args.condition_time:
+        logging.warning("Stage 1 is for unconditional generation. Overriding args.condition_time to False.")
+        args.condition_time = False
+    
+    # Clean up temporary command-line override attributes
+    delattr(args, 'trainable_ae_cmd')
+    delattr(args, 'condition_time_cmd')
 
-    x_sample_for_model = diffusion_utils.remove_mean_with_mask(x_sample_normalized, node_mask_sample)
-    one_hot_sample_for_model = one_hot_sample_normalized * node_mask_sample
-    charges_sample_for_model = charges_sample_raw * node_mask_sample
-    h_sample_for_model = {'categorical': one_hot_sample_for_model, 'integer': charges_sample_for_model}
+    # Override latent_nf to 2, based on GeoLDM README for pretrained model compatibility.
+    desired_latent_nf = 2
+    current_latent_nf = getattr(args, 'latent_nf', 'Not set')
+    if current_latent_nf != desired_latent_nf:
+        logging.info(f"Overriding args.latent_nf from {current_latent_nf} to {desired_latent_nf} "
+                     "for GeoLDM pretrained model compatibility (README states latent_nf=2).")
+    args.latent_nf = desired_latent_nf
 
-    # Ensure model's gamma tensor is on the correct device
-    if hasattr(model, 'gamma'):
-        model.gamma = model.gamma.to(device)
-    if hasattr(model, 'dynamics') and hasattr(model.dynamics, 'gamma'):
-        model.dynamics.gamma = model.dynamics.gamma.to(device)
-
-    original_training_state = model.training
-    model.eval()
-
-    for iteration in range(iterations):
-        logging.info(f"  LSUV Iteration {iteration + 1}/{iterations}")
-        iteration_max_std_dev = 0.0
-        iteration_max_mean_dev = 0.0
-        
-        for path, module in modules:
-            if not isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-                continue
-
-            handle = module.register_forward_hook(hook_fn_lsuv)
-            with torch.no_grad():
-                _ = model(x_sample_for_model, h_sample_for_model, node_mask_sample, edge_mask_sample, context=None)
-            handle.remove()
-
-            if captured_output_lsuv is not None:
-                adjusted_activations = captured_output_lsuv.detach()
-                captured_output_lsuv = None
-                
-                # Apply masking to adjusted activations if they have the same shape as node_mask
-                if adjusted_activations.shape[:2] == node_mask_sample.shape[:2]:
-                    adjusted_activations = adjusted_activations * node_mask_sample
-                
-                finite_adjusted = adjusted_activations[torch.isfinite(adjusted_activations)]
-                if finite_adjusted.numel() > 0:
-                    mean_after_adjust = finite_adjusted.mean()
-                    std_after_adjust = finite_adjusted.std()
-                    iteration_max_mean_dev = max(iteration_max_mean_dev, abs(mean_after_adjust.item() - target_mean))
-                    iteration_max_std_dev = max(iteration_max_std_dev, abs(std_after_adjust.item() - target_std))
-
-        max_mean_deviation_from_target = iteration_max_mean_dev
-        max_std_deviation_from_target = iteration_max_std_dev
-        
-        logging.info(f"  LSUV Iteration {iteration + 1} ended. Max mean_dev ~ {max_mean_deviation_from_target:.4f}, Max std_dev_from_target={max_std_deviation_from_target:.4f}")
-        if max_std_deviation_from_target < tolerance and max_mean_deviation_from_target < tolerance:
-            logging.info(f"  LSUV converged after {iteration + 1} iterations.")
-            break
-            
-    model.train(original_training_state)
-    logging.info("LSUV-like initialization finished.")
-# --- End of LSUV Global and Helper Functions ---
-
-# --- Argument Parsing Setup ---
-# Define parser first
-parser = argparse.ArgumentParser(description='GeoLDM Lipid Adaptation (Stage 1 - Unlabeled)')
-parser.add_argument('--log_file', type=str, default=None, help='Path to save log file. If None, logs to console.')
-parser.add_argument('--exp_name', type=str, default='geoldm_lipid_adapt_stage1', help='Experiment name for logging and output')
-parser.add_argument('--output_dir', type=str, default='outputs', help='Directory to save outputs and checkpoints')
-
-# --- Data Arguments --- 
-parser.add_argument('--unlabeled_data_path', type=str, required=True, help='Path to processed UNLABELED lipid data (e.g., processed_unlabeled_lipids.pkl from SDF)')
-# Removed: --lipid_stats_path
-parser.add_argument('--num_workers', type=int, default=0, help='Number of workers for DataLoader')
-parser.add_argument('--dataset', type=str, default='geom', help='Base dataset type (used for dataset_info, should match pretrained model)')
-parser.add_argument('--remove_h', action='store_true', help='Use dataset config without hydrogens (ensure model matches)') # Keep consistency with pretrained
-parser.add_argument('--val_split_ratio', type=float, default=0.01, help='Fraction of unlabeled data for validation (can be small/zero for adaptation)')
-
-# --- Model Loading Arguments --- 
-parser.add_argument('--pretrained_path', type=str, required=True, help='Path to the folder containing pretrained GEOM model (.npy, .pickle files) to adapt')
-parser.add_argument('--model_name', type=str, default='generative_model_ema.npy', help='Name of the model state_dict file to load')
-
-# --- Adaptation Arguments (similar to Fine-tuning) --- 
-parser.add_argument('--n_epochs', type=int, default=50, help='Number of adaptation epochs (adjust as needed)')
-parser.add_argument('--batch_size', type=int, default=32, help='Batch size (adjust based on GPU memory)')
-parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate for adaptation (might need lower than Stage 2)')
-parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay rate, 0 to disable')
-parser.add_argument('--test_epochs', type=int, default=5, help='Run validation every N epochs')
-parser.add_argument('--save_model', type=eval, default=True, help='Save checkpoints')
-parser.add_argument('--clip_grad', type=eval, default=True, help='Clip gradients during training')
-parser.add_argument('--clip_value', type=float, default=1.0, help='Value for gradient clipping')
-parser.add_argument('--n_report_steps', type=int, default=50, help='Log training progress every N steps')
-parser.add_argument('--ode_regularization', type=float, default=1e-3, help='ODE regularization weight')
-
-# --- Conditioning Arguments --- 
-# REMOVED: --conditioning argument
-# REMOVED: --cfg_prob argument
-
-# --- Diffusion Arguments (load from pickle) --- 
-# Defaults are provided but should be overridden by loaded args.pickle
-parser.add_argument('--diffusion_steps', type=int, default=1000)
-parser.add_argument('--diffusion_noise_schedule', type=str, default='polynomial_2')
-parser.add_argument('--diffusion_loss_type', type=str, default='l2')
-parser.add_argument('--diffusion_noise_precision', type=float, default=1e-5)
-
-# --- Model Architecture Arguments (load from pickle) --- 
-parser.add_argument('--model', type=str, default='egnn_dynamics')
-parser.add_argument('--n_layers', type=int, default=4)
-parser.add_argument('--nf', type=int, default=256)
-parser.add_argument('--latent_nf', type=int, default=2)
-parser.add_argument('--tanh', type=eval, default=True)
-parser.add_argument('--attention', type=eval, default=True)
-parser.add_argument('--norm_constant', type=float, default=1)
-parser.add_argument('--inv_sublayers', type=int, default=1)
-parser.add_argument('--sin_embedding', type=eval, default=False)
-parser.add_argument('--include_charges', type=eval, default=True) # Keep consistency with pretrained
-parser.add_argument('--normalization_factor', type=float, default=1.0)
-parser.add_argument('--aggregation_method', type=str, default='sum')
-parser.add_argument('--kl_weight', type=float, help='Weight for KL divergence term in VAE loss (if VAE is trained).')
-parser.add_argument('--train_diffusion', type=eval, help='Whether to train the diffusion model component.')
-
-# Boolean flags for trainable_ae - will be reconciled with pickle default later
-# Use a temporary destination to detect if user explicitly used the flag
-parser.add_argument('--trainable_ae_cmd', dest='trainable_ae_cmd', action='store_true', default=None, help='Command-line: Set VAE to be trainable. If both this and --no-trainable_ae_cmd are given, the last one wins.')
-parser.add_argument('--no-trainable_ae_cmd', dest='trainable_ae_cmd', action='store_false', help='Command-line: Set VAE to be NOT trainable (frozen).')
-
-# Boolean flags for condition_time - will be reconciled with pickle default later
-parser.add_argument('--condition_time_cmd', dest='condition_time_cmd', action='store_true', default=None, help='Command-line: Set dynamics model to be conditioned on time. If both this and --no-condition_time_cmd are given, the last one wins.')
-parser.add_argument('--no-condition_time_cmd', dest='condition_time_cmd', action='store_false', help='Command-line: Set dynamics model to be NOT conditioned on time.')
-
-parser.add_argument('--normalize_factors', type=eval, help='Tuple of normalization factors for x, h_cat, h_int.')
-
-# --- Other Arguments --- 
-parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
-parser.add_argument('--wandb_usr', type=str, default=None, help='WandB username')
-parser.add_argument('--wandb_project', type=str, default='e3_diffusion_lipid_adapt_stage1', help='WandB project name')
-parser.add_argument('--online', type=bool, default=True, help='WandB online mode')
-parser.add_argument('--no_cuda', action='store_true', default=False, help='Disable CUDA')
-parser.add_argument('--seed', type=int, default=42, help='Random seed')
-
-# --- Load Pretrained Args (BEFORE parsing) ---
-# Need to manually parse just the pretrained_path argument first
-temp_parser = argparse.ArgumentParser(add_help=False)
-temp_parser.add_argument('--pretrained_path', type=str, required=True)
-known_args, _ = temp_parser.parse_known_args()
-pretrained_args_path = join(known_args.pretrained_path, 'args.pickle')
-loaded_pretrained_args = None
-try:
-    with open(pretrained_args_path, 'rb') as f:
-        loaded_pretrained_args = pickle.load(f)
-    logging.info(f"Loaded arguments from pretrained model: {pretrained_args_path}")
-except Exception as e:
-    logging.error(f"Error: Could not load required pretrained args.pickle from {pretrained_args_path}. Error: {e}. Exiting.")
-    exit(1)
-
-# Store the trainable_ae value from pickle if it exists
-pickle_trainable_ae = getattr(loaded_pretrained_args, 'trainable_ae', True) # Default to True if not in pickle for some reason
-
-# Store the condition_time value from pickle if it exists
-pickle_condition_time = getattr(loaded_pretrained_args, 'condition_time', True) # Default to True (common for these models)
-
-# --- Set Defaults from Loaded Args ---
-# Critical keys that define the model architecture and diffusion process
-# These should NOT be overridden by command-line arguments easily
-critical_keys_to_set_defaults = [
-    'model', 'n_layers', 'nf', 'latent_nf', 'tanh', 'attention',
-    'norm_constant', 'inv_sublayers', 'sin_embedding', 'include_charges',
-    'normalization_factor', 'aggregation_method', 'dataset', 'remove_h',
-    'diffusion_steps', 'diffusion_noise_schedule', 'diffusion_loss_type',
-    'diffusion_noise_precision', 'normalize_factors',
-    'kl_weight', 'train_diffusion', 'condition_time'
-]
-loaded_defaults = {}
-for key in critical_keys_to_set_defaults:
-    if hasattr(loaded_pretrained_args, key):
-        loaded_defaults[key] = getattr(loaded_pretrained_args, key)
-    else:
-        logging.warning(f"Warning: Critical key '{key}' not found in pretrained args. Using script default.")
-
-logging.info("Updating parser defaults based on pretrained args (for non-overridden critical keys):")
-for key, value in loaded_defaults.items():
-    logging.info(f"  Setting default for '{key}': {value}")
-parser.set_defaults(**loaded_defaults)
-
-# --- Parse ALL Arguments ---
-# Now parse, command-line args will override non-critical defaults set above
-args = parser.parse_args()
-
-# --- Reconcile trainable_ae ---
-# Command line (--trainable_ae_cmd or --no-trainable_ae_cmd) takes precedence.
-# If neither was used, fall back to the value from the pickle file.
-if args.trainable_ae_cmd is not None:
-    args.trainable_ae = args.trainable_ae_cmd  # Command-line flag was used
-    logging.info(f"INFO: 'trainable_ae' explicitly set to {args.trainable_ae} by command-line argument.")
-else:
-    args.trainable_ae = pickle_trainable_ae  # No command-line flag, use pickle default
-    logging.info(f"INFO: 'trainable_ae' set to {args.trainable_ae} from pickle default (no command-line override for trainable_ae).")
-delattr(args, 'trainable_ae_cmd') # Clean up the temporary command-line argument storage
-
-# --- Reconcile condition_time ---
-if args.condition_time_cmd is not None:
-    args.condition_time = args.condition_time_cmd
-    logging.info(f"INFO: 'condition_time' explicitly set to {args.condition_time} by command-line argument.")
-else:
-    args.condition_time = pickle_condition_time
-    logging.info(f"INFO: 'condition_time' set to {args.condition_time} from pickle default (no command-line override for condition_time).")
-delattr(args, 'condition_time_cmd')
-
-# Override latent_nf to 3 if loading a pretrained model,
-# as the original GeoLDM drugs_latent2 checkpoint requires latent_nf=3 for its VAE.
-if args.pretrained_path: 
-    logging.info(f"INFO: Pretrained model path specified: {args.pretrained_path}")
-    # Check if latent_nf needs to be set or overridden
-    # The default from the pickle might be 2, but the actual model weights correspond to 3.
-    if getattr(args, 'latent_nf', None) != 3:
-        logging.info(f"INFO: Overriding args.latent_nf from {getattr(args, 'latent_nf', 'Not set')} to 3 for checkpoint compatibility.")
-        args.latent_nf = 3
-    else:
-        logging.info(f"INFO: args.latent_nf is already 3. No override needed.")
-else:
-    # This block might not be strictly necessary if latent_nf default is sensible without a pretrained model
-    logging.info("INFO: No pretrained_path specified, not overriding latent_nf (using parsed/default value).")
-
-# Set probabilistic_model, as it's expected by the loss function
-# and other parts of the original GeoLDM framework.
-# For EnLatentDiffusion, this should be 'diffusion'.
-if not hasattr(args, 'probabilistic_model'):
-    logging.info("INFO: Setting args.probabilistic_model = 'diffusion'")
+    # Ensure probabilistic_model is set for GeoLDM framework (should be diffusion)
+    if not hasattr(args, 'probabilistic_model') or args.probabilistic_model != 'diffusion':
+        logging.info("Setting/forcing args.probabilistic_model = 'diffusion' for compatibility.")
     args.probabilistic_model = 'diffusion'
-elif args.probabilistic_model != 'diffusion':
-    logging.warning(f"WARNING: args.probabilistic_model was {args.probabilistic_model}. Forcing to 'diffusion' for EnLatentDiffusion.")
-    args.probabilistic_model = 'diffusion'
+    
+    # Set context_node_nf to 0 for unconditional Stage 1
+    if getattr(args, 'context_node_nf', -1) != 0: # Use -1 as a sentinel if not present
+        logging.info("Setting args.context_node_nf to 0 for unconditional Stage 1 adaptation.")
+    args.context_node_nf = 0
 
-# --- Setup Device, Seed, and Output Dirs --- 
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device("cuda" if args.cuda else "cpu")
-dtype = torch.float32
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
-if args.cuda:
-    torch.cuda.manual_seed_all(args.seed)
+    # External normalization is used, so model's internal normalization factors should be identity.
+    identity_norm_factors = [1.0, 1.0, 1.0]
+    if getattr(args, 'normalize_factors', None) != identity_norm_factors:
+        logging.info(f"Setting args.normalize_factors to {identity_norm_factors} for external dataset normalization.")
+    args.normalize_factors = identity_norm_factors
 
-args.output_dir = join(args.output_dir, args.exp_name)
-utils.create_folders(args)
 
-# --- Setup Logging (after parsing args and creating output_dir) ---
-log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-root_logger = logging.getLogger() # Get the root logger
+def _parse_and_prepare_args() -> tuple[argparse.Namespace, torch.device]:
+    '''
+    Parses command-line arguments, loads arguments from the pretrained model,
+    reconciles them, and sets up essential configurations.
 
-# Set level for the root logger itself
-# All handlers will inherit this level unless they set their own lower level
-root_logger.setLevel(logging.INFO) # Or logging.DEBUG for more verbosity
+    Returns:
+        A tuple containing the finalized arguments (Namespace) and the device (torch.device).
+    '''
+    parser = _create_arg_parser()
+    # Initial parse to get pretrained_path for loading original args
+    temp_args, _ = parser.parse_known_args()
 
-# Remove any pre-existing handlers from the root logger
-# This is important if the script might be run multiple times in the same session (e.g., a notebook)
-for handler in root_logger.handlers[:]:
-    root_logger.removeHandler(handler)
-    handler.close() # Close the handler before removing
+    loaded_pretrained_args = None
+    if not temp_args.pretrained_path:
+        logging.error("--pretrained_path is a required argument. Exiting.")
+        sys.exit(1)
 
-# Console handler (always logs to console)
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(log_formatter)
-root_logger.addHandler(console_handler)
-
-# File handler (only if --log_file is specified)
-if args.log_file:
+    pretrained_args_path = join(temp_args.pretrained_path, PRETRAINED_ARGS_FILENAME)
     try:
-        log_file_path = Path(args.log_file)
-        # Ensure the directory for the log file exists
-        log_file_dir = log_file_path.parent
-        if not log_file_dir.exists():
-            log_file_dir.mkdir(parents=True, exist_ok=True)
-            # print(f"DEBUG: Created directory for log file: {log_file_dir}") # Temporary debug
-        
-        file_handler = logging.FileHandler(args.log_file, mode='a') # 'a' for append
-        file_handler.setFormatter(log_formatter)
-        root_logger.addHandler(file_handler)
-        logging.info(f"Logging to file: {args.log_file}") # This message will go to console and file
+        with open(pretrained_args_path, 'rb') as f:
+            loaded_pretrained_args = pickle.load(f)
+        logging.info(f"Successfully loaded arguments from pretrained model: {pretrained_args_path}")
+    except FileNotFoundError:
+        logging.error(f"Pretrained arguments file not found at {pretrained_args_path}. Exiting.")
+        sys.exit(1)
     except Exception as e:
-        logging.error(f"Error setting up file logger at {args.log_file}: {e}")
-        # If file logging fails, script continues with console logging
-else:
-    logging.info("Logging to console only (no --log_file specified).")
+        logging.error(f"Error loading pretrained args from {pretrained_args_path}: {e}. Exiting.")
+        sys.exit(1)
 
-# --- Get Dataset Info (AFTER final args are set) ---
-# Ensure remove_h used here corresponds to loaded include_charges
-# Typically, if include_charges is True, remove_h should be False, and vice-versa
-# We rely on the pretrained_args to have consistent values for these.
-dataset_info = get_dataset_info(dataset_name=args.dataset, remove_h=args.remove_h)
-logging.info(f"Using dataset info for: {args.dataset} (remove_h={args.remove_h}, loaded include_charges={args.include_charges})")
-
-# --- Wandb Setup --- 
-if args.no_wandb:
-    mode = 'disabled'
-    logging.info("WandB logging is disabled.")
-else:
-    mode = 'online' if args.online else 'offline'
-    if not args.wandb_usr:
-        args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
-if not args.no_wandb:
-    kwargs = {'entity': args.wandb_usr, 'name': args.exp_name, 'project': args.wandb_project, 'config': args,
-              'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': mode}
-    wandb.init(**kwargs)
-    wandb.save('*.txt')
-
-logging.info("Effective Arguments for Stage 1 Adaptation:")
-for k, v in vars(args).items():
-    logging.info(f"  {k}: {v}")
-
-# --- Load Data --- 
-# Load the UNLABELED data using the specific path argument
-# Use val_split_ratio from args to control validation set size (can be 0)
-dataloaders = lipid_dataset.get_dataloaders(
-    data_path=args.unlabeled_data_path,
-    batch_size=args.batch_size, # Batch size here is for training, for histogram can iterate dataset directly
-    num_workers=args.num_workers,
-    seed=args.seed,
-    val_split_ratio=args.val_split_ratio # Control split here
-)
-
-if dataloaders is None:
-    logging.error("Error: Failed to create dataloaders. Exiting.")
-    exit(1)
-if not dataloaders['train']:
-    logging.error("Error: Training dataloader is empty. Check data path and preprocessing. Exiting.")
-    exit(1)
-if not dataloaders['val'] and args.val_split_ratio > 0:
-     logging.warning("Warning: Validation dataloader is empty, but validation split ratio > 0.")
-
-# --- Calculate n_nodes histogram from the actual training data ---
-logging.info("Calculating n_nodes histogram from the loaded unlabeled training data...")
-n_nodes_counts = Counter()
-try:
-    train_dataset = dataloaders['train'].dataset
-    for i in range(len(train_dataset)):
-        sample = train_dataset[i]
-        if 'positions' in sample and hasattr(sample['positions'], 'shape'):
-            num_nodes = sample['positions'].shape[0]
-            n_nodes_counts[num_nodes] += 1
-        elif 'num_atoms' in sample: # Fallback if 'num_atoms' field exists
-            num_nodes = sample['num_atoms']
-            if isinstance(num_nodes, torch.Tensor):
-                num_nodes = num_nodes.item()
-            n_nodes_counts[num_nodes] +=1
+    # Set defaults in the parser from the loaded pretrained_args.
+    # Command-line arguments will override these if provided.
+    default_overrides = {
+        k: v for k, v in vars(loaded_pretrained_args).items()
+        if hasattr(parser.get_default(k) if parser.get_default(k) is not None else None, '__dict__') # Check if it's a namespace
+           or parser.get_default(k) != v # Only override if different, or for complex types
+    }
+    # Filter out keys that are specific parser actions or not meant to be set this way
+    critical_keys_to_set_defaults = [
+        'model', 'n_layers', 'nf', 'latent_nf', 'tanh', 'attention',
+        'norm_constant', 'inv_sublayers', 'sin_embedding', 'include_charges',
+        'normalization_factor', 'aggregation_method', 'dataset', 'remove_h',
+        'diffusion_steps', 'diffusion_noise_schedule', 'diffusion_loss_type',
+        'diffusion_noise_precision', 'normalize_factors',
+        'kl_weight', 'train_diffusion', 'condition_time'
+    ]
+    loaded_defaults_for_parser = {}
+    for key in critical_keys_to_set_defaults:
+        if hasattr(loaded_pretrained_args, key):
+            loaded_defaults_for_parser[key] = getattr(loaded_pretrained_args, key)
         else:
-            logging.warning(f"Could not determine num_nodes for sample {i} in train_dataset. Skipping for histogram.")
+            logging.warning(f"Key '{key}' not found in pretrained args. Script/argparse default will be used.")
+    parser.set_defaults(**loaded_defaults_for_parser)
+
+    # Final parse of all arguments
+    args = parser.parse_args()
+
+    # Finalize arguments (handle overrides, set Stage 1 specifics)
+    _finalize_args(args, loaded_pretrained_args)
+    
+    # Setup device
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    device = torch.device("cuda" if args.cuda else "cpu")
+    
+    return args, device
+
+
+# --- Setup Functions ---
+def _setup_environment(args: argparse.Namespace, device: torch.device):
+    '''Sets up random seeds and creates output directories.'''
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed_all(args.seed)
+    logging.info(f"Using device: {device}")
+    logging.info(f"Set random seed: {args.seed}")
+
+    # Create output directories
+    args.output_dir = join(args.output_dir, args.exp_name) # Final experiment output path
+    args.checkpoints_dir = join(args.output_dir, 'checkpoints') # Specific checkpoints path
+    # project_utils.create_folders(args) # Original call had issues with Namespace
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.checkpoints_dir, exist_ok=True)
+    logging.info(f"Output directory: {args.output_dir}")
+    logging.info(f"Checkpoints directory: {args.checkpoints_dir}")
+
+
+def _setup_logging(log_file_path: str | None):
+    '''Initializes logging to console and optionally to a file.'''
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Clear existing handlers to avoid duplicate logging
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    root_logger.addHandler(console_handler)
+
+    if log_file_path:
+        try:
+            log_path = Path(log_file_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_path, mode='a')
+            file_handler.setFormatter(log_formatter)
+            root_logger.addHandler(file_handler)
+            logging.info(f"Logging to file: {log_file_path}")
+        except Exception as e:
+            logging.error(f"Failed to set up file logger at {log_file_path}: {e}")
+    else:
+        logging.info("Logging to console only (no --log_file specified).")
+
+
+def _setup_wandb(args: argparse.Namespace):
+    '''Initializes Weights & Biases if enabled.'''
+    if args.no_wandb:
+        logging.info("WandB logging is disabled.")
+        return
+
+    mode = 'online' if args.online else 'offline'
+    wandb_entity = args.wandb_usr if args.wandb_usr else project_utils.get_wandb_username(args.wandb_usr)
+    
+    try:
+        wandb.init(
+            entity=wandb_entity,
+            name=args.exp_name,
+            project=args.wandb_project,
+            config=vars(args), # Pass all args as config
+            settings=wandb.Settings(_disable_stats=True),
+            reinit=True,
+            mode=mode
+        )
+        # wandb.save('*.txt') # Example: save text files in the run directory
+        logging.info(f"WandB initialized: project='{args.wandb_project}', name='{args.exp_name}', mode='{mode}'.")
+    except Exception as e:
+        logging.error(f"Error initializing WandB: {e}. Continuing without WandB.")
+        args.no_wandb = True # Disable further WandB calls
+
+    logging.info("Final Effective Arguments for Stage 1 Adaptation:")
+    for k, v in sorted(vars(args).items()):
+        logging.info(f"  {k}: {v}")
+
+
+# --- Data Handling ---
+def _compute_dataset_statistics(args: argparse.Namespace, train_dataset: torch.utils.data.Dataset, device: torch.device):
+    '''
+    Computes and stores dataset normalization statistics (mean/std for positions and one-hot features)
+    in the args object.
+    '''
+    logging.info("Calculating dataset normalization statistics for positions and one-hot features...")
+    all_positions_list, all_one_hot_list = [], []
+
+    for i in tqdm(range(len(train_dataset)), desc="Processing samples for stats"):
+        sample_data = train_dataset[i]
+        if not all(k in sample_data for k in ['positions', 'one_hot', 'atom_mask']):
+            logging.warning(f"Sample {i} is missing required keys ('positions', 'one_hot', or 'atom_mask'). Skipping for stats.")
+            continue
+
+        pos_tensor = sample_data['positions'].to(device)      # Shape: (1, N, 3)
+        one_hot_tensor = sample_data['one_hot'].to(device)  # Shape: (1, N, num_atom_types)
+        atom_mask_tensor = sample_data['atom_mask'].to(device) # Shape: (1, N, 1)
+
+        # Squeeze out the batch dimension (1) and the feature dimension (1) for the mask
+        valid_indices = atom_mask_tensor.squeeze(0).squeeze(-1).bool() # Shape: (N)
+
+        if torch.any(valid_indices):
+            # Squeeze out batch dim from positions and one_hot before masking
+            pos_tensor_squeezed = pos_tensor.squeeze(0)          # Shape: (N, 3)
+            one_hot_tensor_squeezed = one_hot_tensor.squeeze(0)  # Shape: (N, num_atom_types)
+
+            masked_pos_tensor = pos_tensor_squeezed[valid_indices]
+            masked_one_hot_tensor = one_hot_tensor_squeezed[valid_indices]
+
+            if masked_pos_tensor.numel() > 0:
+                all_positions_list.append(masked_pos_tensor.cpu().numpy())
+            if masked_one_hot_tensor.numel() > 0:
+                all_one_hot_list.append(masked_one_hot_tensor.cpu().numpy())
+        else:
+            logging.warning(f"Sample {i} has no valid atoms per atom_mask. Skipping for stats.")
+
+    if not all_positions_list or not all_one_hot_list:
+        logging.error("No valid data found after masking for normalization statistics. Exiting.")
+        sys.exit(1)
+
+    all_positions_np = np.concatenate(all_positions_list, axis=0)
+    all_one_hot_np = np.concatenate(all_one_hot_list, axis=0)
+
+    # Filter out NaNs/Infs that might have slipped through (e.g., from RDKit errors)
+    all_positions_np = all_positions_np[~np.isnan(all_positions_np).any(axis=1)]
+    all_positions_np = all_positions_np[~np.isinf(all_positions_np).any(axis=1)]
+    all_one_hot_np = all_one_hot_np[~np.isnan(all_one_hot_np).any(axis=1)]
+    all_one_hot_np = all_one_hot_np[~np.isinf(all_one_hot_np).any(axis=1)]
+    
+    if all_positions_np.shape[0] == 0 or all_one_hot_np.shape[0] == 0:
+        logging.error("No valid data after NaN/Inf filtering for normalization stats. Exiting.")
+        sys.exit(1)
+
+    args.dataset_x_mean = torch.from_numpy(np.mean(all_positions_np, axis=0)).float()
+    args.dataset_x_std = torch.from_numpy(np.std(all_positions_np, axis=0)).float()
+    args.dataset_x_std[args.dataset_x_std < 1e-6] = 1.0 # Prevent division by zero
+
+    args.dataset_h_cat_mean = torch.from_numpy(np.mean(all_one_hot_np, axis=0)).float()
+    args.dataset_h_cat_std = torch.from_numpy(np.std(all_one_hot_np, axis=0)).float()
+    args.dataset_h_cat_std[args.dataset_h_cat_std < 1e-6] = 1.0
+
+    logging.info(f"  Dataset x_mean (coords): {args.dataset_x_mean.tolist()}")
+    logging.info(f"  Dataset x_std (coords): {args.dataset_x_std.tolist()}")
+    logging.info(f"  Dataset h_cat_mean (features): {args.dataset_h_cat_mean.tolist()}")
+    logging.info(f"  Dataset h_cat_std (features): {args.dataset_h_cat_std.tolist()}")
+
+
+def _load_and_prepare_data(args: argparse.Namespace, device: torch.device) -> tuple[dict, dict]:
+    '''
+    Loads dataset_info, creates dataloaders, calculates node histogram,
+    and computes dataset normalization statistics.
+
+    Returns:
+        A tuple containing dataloaders (dict) and dataset_info (dict).
+    '''
+    dataset_info = get_dataset_info(dataset_name=args.dataset, remove_h=args.remove_h)
+    logging.info(f"Initial dataset_info for '{args.dataset}' (remove_h={args.remove_h}, include_charges by arg: {args.include_charges})")
+
+    dataloaders = lipid_dataset.get_dataloaders(
+        data_path=args.unlabeled_data_path,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        val_split_ratio=args.val_split_ratio
+    )
+    if not dataloaders or not dataloaders.get('train'):
+        logging.error("Failed to create dataloaders or training dataloader is missing. Exiting.")
+        sys.exit(1)
+
+    train_dataset = dataloaders['train'].dataset
+    if not train_dataset or len(train_dataset) == 0:
+        logging.error("Training dataset is empty. Cannot compute statistics. Exiting.")
+        sys.exit(1)
+
+    logging.info("Calculating n_nodes histogram from unlabeled training data...")
+    n_nodes_counts = Counter()
+    for i in tqdm(range(len(train_dataset)), desc="Counting nodes per sample"):
+        sample = train_dataset[i]
+        num_nodes = sample.get('positions', torch.empty(0, 0, 0)).shape[1] # (1,N,3) -> N
+        if num_nodes > 0:
+            n_nodes_counts[num_nodes] += 1
+        elif 'num_atoms' in sample: # Fallback
+            num_atoms_val = sample['num_atoms']
+            num_nodes = int(num_atoms_val.item()) if isinstance(num_atoms_val, torch.Tensor) else int(num_atoms_val)
+            if num_nodes > 0: n_nodes_counts[num_nodes] += 1
+            else: logging.warning(f"Sample {i} has 0 atoms based on 'num_atoms' fallback.")
+        else:
+            logging.warning(f"Could not determine num_nodes for sample {i}. Skipping for histogram.")
 
     if not n_nodes_counts:
-        logging.error("Failed to compute n_nodes histogram. It's empty. Check data loading and sample structure. Exiting.")
-        exit(1)
+        logging.error("n_nodes histogram is empty after processing dataset. Check data. Exiting.")
+        sys.exit(1)
+    dataset_info['n_nodes'] = dict(n_nodes_counts)
+    logging.info(f"Updated n_nodes histogram. Min: {min(n_nodes_counts.keys()) if n_nodes_counts else 'N/A'}, "
+                 f"Max: {max(n_nodes_counts.keys()) if n_nodes_counts else 'N/A'}, "
+                 f"Unique sizes: {len(n_nodes_counts)}")
 
-    dataset_info['n_nodes'] = dict(n_nodes_counts) # Update the existing dataset_info
-    logging.info(f"Successfully updated n_nodes histogram from unlabeled data. Example counts (first 5): {list(n_nodes_counts.items())[:5]}")
-    logging.info(f"Min nodes: {min(n_nodes_counts.keys()) if n_nodes_counts else 'N/A'}, Max nodes: {max(n_nodes_counts.keys()) if n_nodes_counts else 'N/A'}, Unique sizes: {len(n_nodes_counts)}")
-except Exception as e_hist:
-    logging.error(f"Error calculating n_nodes histogram from unlabeled data: {e_hist}. Exiting.", exc_info=True)
-    exit(1)
-# --- End of n_nodes histogram calculation ---
-
-# --- Compute Dataset Statistics for Normalization (NEW) ---
-logging.info("Calculating dataset statistics for normalization...")
-all_positions_list = []
-all_one_hot_list = []
-# Iterate through the dataset directly to avoid shuffling and batching artifacts for stats
-temp_dataset_for_stats = dataloaders['train'].dataset
-if not temp_dataset_for_stats or len(temp_dataset_for_stats) == 0: # Check if dataset has items
-    logging.error("Training dataset is empty or has no length, cannot compute normalization stats. Exiting.")
-    exit(1)
-
-for i in range(len(temp_dataset_for_stats)):
-    sample_data = temp_dataset_for_stats[i] # This is a dict of numpy arrays
+    _compute_dataset_statistics(args, train_dataset, device)
     
-    if not all(k in sample_data for k in ['positions', 'one_hot', 'atom_mask']):
-        logging.warning(f"Skipping sample {i} for stats calculation due to missing keys.")
-        continue
-        
-    pos = sample_data['positions']      # (N, 3)
-    one_hot = sample_data['one_hot']    # (N, num_feat_one_hot)
-    atom_mask = sample_data['atom_mask']# (N, 1)
+    return dataloaders, dataset_info
+
+
+# --- Model Building and Initialization ---
+def _initialize_problematic_layers_conservatively(model: torch.nn.Module):
+    '''
+    Applies conservative normal initialization (small std) to specific layers
+    that might be prone to size mismatches or require careful re-initialization
+    if not fully loaded from a checkpoint.
+    '''
+    logging.info("Applying conservative initialization (normal std=0.01) to specific layers...")
+    layers_to_init = {
+        "dynamics.egnn.embedding": None,
+        "dynamics.egnn.embedding_out": None,
+        "vae.encoder.final_mlp.2": None, # Path for a specific Linear layer in a Sequential final_mlp
+        "vae.decoder.egnn.embedding": None
+    }
     
-    valid_indices = atom_mask.squeeze().astype(bool)
-    
-    if np.any(valid_indices): # Ensure there are valid atoms before trying to index
-        masked_pos = pos[valid_indices]
-        masked_one_hot = one_hot[valid_indices]
-    
-        # NEW: Check for NaNs/infs in masked_pos before appending
-        if masked_pos.size > 0:
-            if np.isnan(masked_pos).any() or np.isinf(masked_pos).any():
-                logging.warning(f"Sample {i} position data (after masking) contains NaN/inf. Skipping for position stats.")
-            else:
-                all_positions_list.append(masked_pos)
-        
-        # NEW: Check for NaNs/infs in masked_one_hot before appending
-        if masked_one_hot.size > 0:
-            if np.isnan(masked_one_hot).any() or np.isinf(masked_one_hot).any():
-                logging.warning(f"Sample {i} one_hot data (after masking) contains NaN/inf. Skipping for one_hot stats.")
-            else:
-                all_one_hot_list.append(masked_one_hot)
-    else:
-        logging.warning(f"Sample {i} has no valid atoms based on atom_mask. Skipping for stats.")
-
-
-if not all_positions_list or not all_one_hot_list:
-    logging.error("No valid data found after masking (or all samples had no valid atoms) to compute normalization stats. Check dataset. Exiting")
-    exit(1)
-
-# Concatenate and convert to tensors
-all_positions_np = np.concatenate(all_positions_list, axis=0)
-all_one_hot_np = np.concatenate(all_one_hot_list, axis=0)
-
-all_positions_tensor = torch.from_numpy(all_positions_np).float()
-all_one_hot_tensor = torch.from_numpy(all_one_hot_np).float()
-
-# Calculate stats for positions
-args.dataset_x_mean = torch.mean(all_positions_tensor, dim=0) 
-args.dataset_x_std = torch.std(all_positions_tensor, dim=0)
-args.dataset_x_std[args.dataset_x_std < 1e-6] = 1.0 # Avoid division by zero
-
-# Calculate stats for one-hot features
-args.dataset_h_cat_mean = torch.mean(all_one_hot_tensor, dim=0)
-args.dataset_h_cat_std = torch.std(all_one_hot_tensor, dim=0)
-args.dataset_h_cat_std[args.dataset_h_cat_std < 1e-6] = 1.0
-
-logging.info(f"  Dataset x_mean: {args.dataset_x_mean.tolist()}")
-logging.info(f"  Dataset x_std: {args.dataset_x_std.tolist()}")
-logging.info(f"  Dataset h_cat_mean: {args.dataset_h_cat_mean.tolist()}")
-logging.info(f"  Dataset h_cat_std: {args.dataset_h_cat_std.tolist()}")
-
-original_normalize_factors = args.normalize_factors
-args.normalize_factors = [1.0, 1.0, 1.0] # Make internal normalization an identity op
-logging.info(f"Original args.normalize_factors were {original_normalize_factors}. Set to {args.normalize_factors} for external normalization.")
-# --- End of Dataset Statistics for Normalization ---
-
-
-# --- Set Unconditional Context ---
-args.context_node_nf = 0 # Unconditional for Stage 1
-logging.info(f"Running Stage 1 Adaptation (Unconditional): context_node_nf = {args.context_node_nf}")
-
-
-# --- Create Model --- 
-# args object should now have the correct architecture parameters loaded as defaults
-logging.info(f"Instantiating model (train_diffusion={args.train_diffusion})...")
-# dataset_info now contains the correct n_nodes histogram for the unlabeled data
-model, nodes_dist, prop_dist = get_latent_diffusion(args, device, dataset_info, dataloaders['train'])
-logging.info("Model instantiated.")
-
-# --- Custom Initialization for Problematic Layers (called BEFORE pretrained loading) ---
-def initialize_problematic_layers(model_to_init, args_for_init):
-    # This function should use normal_(mean=0.0, std=0.01) as per previous step
-    logging.info("Applying custom CONSERVATIVE initialization (normal std=0.01) to specific layers with changed sizes (BEFORE LSUV)...")
-    try:
-        # 1. dynamics.egnn.embedding
-        if hasattr(model_to_init, 'dynamics') and hasattr(model_to_init.dynamics, 'egnn') and hasattr(model_to_init.dynamics.egnn, 'embedding'):
-            layer = model_to_init.dynamics.egnn.embedding
-            if isinstance(layer, torch.nn.Linear):
+    for path_str in layers_to_init.keys():
+        layer = _get_module_by_path(model, path_str) # Renamed call
+        if layer and isinstance(layer, torch.nn.Linear):
                 torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01) 
-                if layer.bias is not None:
-                    torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.dynamics.egnn.embedding with normal_(std=0.01)")
-        # ... (repeat for other 3 layers: dynamics.egnn.embedding_out, vae.encoder.final_mlp[2], vae.decoder.egnn.embedding) ...
-        # Ensure all 4 layers from previous edits are covered here with normal_(0,0.01)
-        # 2. dynamics.egnn.embedding_out
-        if hasattr(model_to_init, 'dynamics') and hasattr(model_to_init.dynamics, 'egnn') and hasattr(model_to_init.dynamics.egnn, 'embedding_out'):
-            layer = model_to_init.dynamics.egnn.embedding_out
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
-                if layer.bias is not None:
-                    torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.dynamics.egnn.embedding_out with normal_(std=0.01)")
 
-        # 3. vae.encoder.final_mlp[2]
-        # Note: Accessing final_mlp[2] needs care if model structure changes.
-        # This path should be verified.
-        final_mlp_module = get_layer_by_path(model_to_init, "vae.encoder.final_mlp")
-        if final_mlp_module and isinstance(final_mlp_module, torch.nn.Sequential) and len(final_mlp_module) > 2:
-            layer = final_mlp_module[2]
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
-                if layer.bias is not None:
-                    torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.vae.encoder.final_mlp[2] with normal_(std=0.01)")
-            else:
-                logging.warning("  model.vae.encoder.final_mlp[2] found but not nn.Linear")
-        else:
-            logging.warning("  Could not find or access model.vae.encoder.final_mlp[2] for conservative init.")
-            
-        # 4. vae.decoder.egnn.embedding
-        if hasattr(model_to_init, 'vae') and hasattr(model_to_init.vae, 'decoder') and hasattr(model_to_init.vae.decoder, 'egnn') and hasattr(model_to_init.vae.decoder.egnn, 'embedding'):
-            layer = model_to_init.vae.decoder.egnn.embedding
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
-                if layer.bias is not None:
-                    torch.nn.init.zeros_(layer.bias)
-                logging.info("  Initialized model.vae.decoder.egnn.embedding with normal_(std=0.01)")
+
+def _load_pretrained_weights(model: torch.nn.Module, pretrained_dir: str, model_filename: str, device: torch.device):
+    '''
+    Loads pretrained weights from a checkpoint file into the model.
+    Handles potential "module." prefix from DataParallel training and logs mismatches.
+    '''
+    model_path_full = join(pretrained_dir, model_filename)
+    logging.info(f"Attempting to load pretrained weights from: {model_path_full}")
+    try:
+        state_dict_checkpoint = torch.load(model_path_full, map_location=device)
         
-        logging.info("Conservative custom initialization attempt finished.")
-    except Exception as e:
-        logging.error(f"Error during conservative custom initialization: {e}", exc_info=True)
-# --- End of Custom Conservative Initialization ---
+        # Remove "module." prefix if present (from DataParallel/DistributedDataParallel)
+        if any(key.startswith('module.') for key in state_dict_checkpoint.keys()):
+            logging.info("Removing 'module.' prefix from checkpoint state_dict keys.")
+            state_dict_checkpoint = {k[len('module.'):]: v for k, v in state_dict_checkpoint.items()}
+        
+        current_model_sd = model.state_dict()
+        final_sd_to_load = {}
+        skipped_mismatch_details = []
+        mismatched_module_roots = set()
 
-
-# --- Load Pretrained Weights & Identify Mismatched for LSUV ---
-model_path = join(args.pretrained_path, args.model_name)
-mismatched_module_paths_for_lsuv = set() # Use a set to store unique module paths
-
-logging.info(f"Attempting to load pretrained weights from {model_path}...")
-try:
-    state_dict = torch.load(model_path, map_location=device)
-    if any(key.startswith('module.') for key in state_dict.keys()): # Check if any key starts with 'module.'
-        logging.info("Removing 'module.' prefix from state_dict keys.")
-        state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
-    
-    model_state_dict_ref = model.state_dict() # Reference current model state
-    loaded_keys = set()
-    skipped_keys_size_mismatch = []
-    skipped_keys_other = [] # Keys in checkpoint not in model, or other load errors
-
-    final_state_dict_to_load = {} # Build a state_dict of only matching parameters
-
-    for k_checkpoint, v_checkpoint in state_dict.items():
-        if k_checkpoint in model_state_dict_ref:
-            v_model = model_state_dict_ref[k_checkpoint]
-            if v_model.shape == v_checkpoint.shape:
-                final_state_dict_to_load[k_checkpoint] = v_checkpoint
-                loaded_keys.add(k_checkpoint)
+        for k_ckpt, v_ckpt in state_dict_checkpoint.items():
+            if k_ckpt in current_model_sd:
+                v_model = current_model_sd[k_ckpt]
+                if v_model.shape == v_ckpt.shape:
+                    final_sd_to_load[k_ckpt] = v_ckpt
+                else:
+                    detail = (f"'{k_ckpt}': Model shape {v_model.shape}, Ckpt shape {v_ckpt.shape}")
+                    skipped_mismatch_details.append(detail)
+                    # Get the root module path (e.g., "vae.encoder.final_mlp.2")
+                    mismatched_module_roots.add('.'.join(k_ckpt.split('.')[:-1])) 
             else:
-                logging.warning(f"  Skipping key '{k_checkpoint}' due to size mismatch: Model shape {v_model.shape}, Checkpoint shape {v_checkpoint.shape}")
-                skipped_keys_size_mismatch.append(k_checkpoint)
-                # Extract module path for LSUV: e.g., 'dynamics.egnn.embedding' from 'dynamics.egnn.embedding.weight'
-                module_path = '.'.join(k_checkpoint.split('.')[:-1]) # Remove .weight or .bias
-                mismatched_module_paths_for_lsuv.add(module_path)
-        else:
-            logging.warning(f"  Skipping key '{k_checkpoint}' from checkpoint as it's not in the current model architecture.")
-            skipped_keys_other.append(k_checkpoint)
+                logging.warning(f"  Key '{k_ckpt}' from checkpoint not found in current model. Skipping.")
+        
+        # Load with strict=False to allow partial loading
+        missing_keys, unexpected_keys = model.load_state_dict(final_sd_to_load, strict=False)
+        
+        logging.info(f"Successfully loaded {len(final_sd_to_load)} parameters from checkpoint.")
+        if skipped_mismatch_details:
+            logging.warning(f"  Skipped {len(skipped_mismatch_details)} parameter tensors from "
+                            f"{len(mismatched_module_roots)} unique modules due to SHAPE MISMATCHES:")
+            for detail_msg in skipped_mismatch_details:
+                logging.warning(f"    - {detail_msg}")
+        if missing_keys:
+            logging.warning(f"  {len(missing_keys)} keys were MISSING in the checkpoint but expected by the model (will keep current model init):")
+            # for key in missing_keys: logging.warning(f"    - {key}") # Can be verbose
+        if unexpected_keys:
+            logging.warning(f"  {len(unexpected_keys)} keys were UNEXPECTED (in checkpoint but not in model):")
+            # for key in unexpected_keys: logging.warning(f"    - {key}") # Can be verbose
 
-    # Load the carefully constructed state dict
-    # Using strict=False here is a final fallback, but we've already done the filtering.
-    # More robust is to load into a fresh copy of the model or model.load_state_dict(final_state_dict_to_load, strict=False)
-    # For simplicity, we'll assume model.load_state_dict can handle missing keys gracefully if strict=False
-    # and we only provide matching ones.
-    # However, the primary goal is to apply `final_state_dict_to_load`.
-    # Let's update the model's state dict directly for the keys we want to load.
-    
-    current_model_sd = model.state_dict()
-    current_model_sd.update(final_state_dict_to_load) # Update with loaded weights
-    model.load_state_dict(current_model_sd) # Load the updated state dict
+    except FileNotFoundError:
+        logging.error(f"Pretrained model file not found at {model_path_full}. Critical error. Exiting.")
+        sys.exit(1)
+    except Exception as e_load:
+        logging.error(f"Critical error loading pretrained weights: {e_load}", exc_info=True)
+        sys.exit(1)
 
-    logging.info(f"Successfully attempted load of pretrained weights.")
-    logging.info(f"  Loaded {len(loaded_keys)} matching parameters.")
-    if skipped_keys_size_mismatch:
-        logging.warning(f"  Skipped {len(skipped_keys_size_mismatch)} keys from {len(mismatched_module_paths_for_lsuv)} unique modules due to size mismatches: {skipped_keys_size_mismatch}")
-    if skipped_keys_other:
-        logging.warning(f"  Skipped {len(skipped_keys_other)} other keys (e.g., not in model): {skipped_keys_other}")
 
-except FileNotFoundError:
-    logging.error(f"Error: Pretrained model file not found at {model_path}. Exiting.")
-    exit(1)
-except Exception as e_load:
-    logging.error(f"Error loading pretrained weights: {e_load}", exc_info=True)
-    # Decide if to exit or continue without pretrained weights / LSUV
-    # For now, let's assume if loading fails, LSUV on mismatched might not make sense or use all layers
-    mismatched_module_paths_for_lsuv.clear() # Don't do LSUV if loading failed badly
+def _configure_model_freezing_for_stage1(model: torch.nn.Module, args: argparse.Namespace):
+    '''
+    Configures model parameter freezing for Stage 1 adaptation.
+    - VAE (first_stage_model) is always frozen (args.trainable_ae is forced to False for Stage 1).
+    - Dynamics model (diffusion model) is fully unfrozen.
+    '''
+    if hasattr(model, 'vae') and model.vae is not None:
+        if not args.trainable_ae: # Should be True due to _finalize_args forcing it
+            logging.info("Freezing all parameters in model.vae (Autoencoder) as args.trainable_ae is False for Stage 1.")
+            for param in model.vae.parameters():
+                param.requires_grad = False
+        else: # This case should not be hit if _finalize_args works as intended for Stage 1
+            logging.warning("model.vae parameters will be trainable as args.trainable_ae is True (unusual for Stage 1).")
+            for param in model.vae.parameters():
+                param.requires_grad = True 
+    else:
+        logging.warning("model.vae not found, skipping VAE freezing configuration.")
 
-model = model.to(device)
-model_dp = model # No DataParallel wrapper
-
-# --- FREEZE DYNAMICS MODEL & SELECTIVELY UNFREEZE MISMATCHED LAYERS (NEW) ---
-if hasattr(model, 'dynamics') and model.dynamics is not None:
-    logging.info("Freezing all parameters in model.dynamics...")
-    for param in model.dynamics.parameters():
-        param.requires_grad = False
-    
-    layers_to_unfreeze_in_dynamics = []
-    # Unfreeze model.dynamics.egnn.embedding if it exists
-    dyn_embedding_layer = get_layer_by_path(model, "dynamics.egnn.embedding")
-    if dyn_embedding_layer and isinstance(dyn_embedding_layer, torch.nn.Module):
-        logging.info("  Unfreezing model.dynamics.egnn.embedding parameters.")
-        for param in dyn_embedding_layer.parameters():
+    if hasattr(model, 'dynamics') and model.dynamics is not None:
+        logging.info("Unfreezing all parameters in model.dynamics for Stage 1 adaptation.")
+        unfrozen_dynamics_count = 0
+        for param in model.dynamics.parameters():
             param.requires_grad = True
-        layers_to_unfreeze_in_dynamics.append("dynamics.egnn.embedding")
+            unfrozen_dynamics_count += param.numel()
+        logging.info(f"Successfully unfroze all {unfrozen_dynamics_count} parameters in model.dynamics.")
     else:
-        logging.warning("  Could not find model.dynamics.egnn.embedding to unfreeze.")
+        logging.warning("model.dynamics not found, skipping dynamics unfreezing configuration.")
 
-    # Unfreeze the LAST GCL layer in model.dynamics.egnn.gcl_layers (NEW)
-    if hasattr(args, 'n_layers') and args.n_layers > 0:
-        last_gcl_layer_idx = args.n_layers - 1
-        last_gcl_layer_path = f"dynamics.egnn.gcl_layers.{last_gcl_layer_idx}"
-        dyn_last_gcl_layer = get_layer_by_path(model, last_gcl_layer_path)
-        if dyn_last_gcl_layer and isinstance(dyn_last_gcl_layer, torch.nn.Module):
-            logging.info(f"  Unfreezing {last_gcl_layer_path} parameters.")
-            for param in dyn_last_gcl_layer.parameters():
-                param.requires_grad = True
-            layers_to_unfreeze_in_dynamics.append(last_gcl_layer_path)
-        else:
-            logging.warning(f"  Could not find {last_gcl_layer_path} to unfreeze.")
+
+def _build_model_and_optimizer_ema(args: argparse.Namespace, device: torch.device,
+                                   dataset_info: dict, dataloaders: dict
+                                   ) -> tuple[torch.nn.Module, any, torch.optim.Optimizer, diffusion_utils.EMA | None, torch.nn.Module | None]:
+    '''
+    Initializes the model, loads pretrained weights, configures layer freezing,
+    and creates the optimizer and EMA objects.
+    LSUV initialization is skipped for Stage 1.
+    '''
+    logging.info(f"Instantiating model (train_diffusion={args.train_diffusion}, trainable_ae={args.trainable_ae})...")
+    # Dataloader_train is passed for nodes_dist and potentially prop_dist if used by model.
+    model, nodes_dist, _ = get_latent_diffusion(args, device, dataset_info, dataloaders['train'])
+    logging.info("Model components instantiated.")
+
+    # Fallback conservative initialization for layers that might not load from checkpoint.
+    _initialize_problematic_layers_conservatively(model)
+    
+    # Load pretrained weights for the entire model.
+    _load_pretrained_weights(model, args.pretrained_path, args.model_name, device)
+    model.to(device) # Ensure model is on the correct device after loading.
+
+    # Configure freezing: VAE frozen, Dynamics unfrozen for Stage 1.
+    _configure_model_freezing_for_stage1(model, args)
+
+    logging.info("Skipping LSUV initialization for Stage 1 as dynamics model is fully unfrozen "
+                 "from pretrained weights and VAE is fixed.")
+
+    optimizer = get_optim(args, model) # get_optim filters for param.requires_grad == True
+    trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Optimizer created with LR: {args.lr}. Trainable parameters: {trainable_params_count}")
+
+    ema_updater, model_ema_obj = None, None
+    if args.ema_decay > 0:
+        ema_updater = diffusion_utils.EMA(args.ema_decay)
+        model_ema_obj = copy.deepcopy(model)
+        model_ema_obj.to(device) # Ensure EMA model is also on device
+        logging.info(f"EMA enabled with decay: {args.ema_decay}")
     else:
-        logging.warning("  args.n_layers not available or invalid, cannot unfreeze last GCL layer.")
+        logging.info("EMA disabled (ema_decay <= 0).")
 
-    # Unfreeze model.dynamics.egnn.embedding_out if it exists
-    dyn_embedding_out_layer = get_layer_by_path(model, "dynamics.egnn.embedding_out")
-    if dyn_embedding_out_layer and isinstance(dyn_embedding_out_layer, torch.nn.Module):
-        logging.info("  Unfreezing model.dynamics.egnn.embedding_out parameters.")
-        for param in dyn_embedding_out_layer.parameters():
-            param.requires_grad = True
-        layers_to_unfreeze_in_dynamics.append("dynamics.egnn.embedding_out")
-    else:
-        logging.warning("  Could not find model.dynamics.egnn.embedding_out to unfreeze.")
-    logging.info("Selective freezing/unfreezing of dynamics model complete.")
-else:
-    logging.warning("model.dynamics not found, skipping selective freezing.")
-
-# Note: VAE freezing is handled by args.trainable_ae = False, which should prevent its params from being passed to optimizer
-# or by ensuring get_optim filters by requires_grad.
-
-# Update mismatched_module_paths_for_lsuv to only include the ones we actually unfroze and want to LSUV
-# This assumes LSUV should only run on trainable layers we are trying to adapt.
-# The original mismatched_module_paths_for_lsuv included VAE layers if they were mismatched.
-# For VAE layers, if trainable_ae is False, LSUV on them is moot as they won't train.
-# So, we refine mismatched_module_paths_for_lsuv for clarity and intent.
-
-final_mismatched_paths_for_lsuv = []
-if "dynamics.egnn.embedding" in layers_to_unfreeze_in_dynamics and "dynamics.egnn.embedding" in mismatched_module_paths_for_lsuv:
-    final_mismatched_paths_for_lsuv.append("dynamics.egnn.embedding")
-if "dynamics.egnn.embedding_out" in layers_to_unfreeze_in_dynamics and "dynamics.egnn.embedding_out" in mismatched_module_paths_for_lsuv:
-    final_mismatched_paths_for_lsuv.append("dynamics.egnn.embedding_out")
-
-# If VAE is trainable (args.trainable_ae is True) and has mismatched layers identified for LSUV:
-if args.trainable_ae: # This should be false based on current logs, but good practice for robustness
-    if "vae.encoder.final_mlp.2" in mismatched_module_paths_for_lsuv:
-        final_mismatched_paths_for_lsuv.append("vae.encoder.final_mlp.2")
-    if "vae.decoder.egnn.embedding" in mismatched_module_paths_for_lsuv:
-        final_mismatched_paths_for_lsuv.append("vae.decoder.egnn.embedding")
-
-# Add the last GCL layer to LSUV targets if it was unfrozen and originally mismatched (NEW)
-if hasattr(args, 'n_layers') and args.n_layers > 0:
-    last_gcl_layer_idx = args.n_layers - 1
-    last_gcl_layer_path = f"dynamics.egnn.gcl_layers.{last_gcl_layer_idx}"
-    if last_gcl_layer_path in layers_to_unfreeze_in_dynamics and last_gcl_layer_path in mismatched_module_paths_for_lsuv:
-        if last_gcl_layer_path not in final_mismatched_paths_for_lsuv: # Avoid duplicates
-             final_mismatched_paths_for_lsuv.append(last_gcl_layer_path)
-
-logging.info(f"Final module paths targeted for LSUV (must be trainable and originally mismatched): {final_mismatched_paths_for_lsuv}")
-
-# --- LSUV-like Initialization for Mismatched Layers (NEW) ---
-if final_mismatched_paths_for_lsuv: # Use the filtered list
-    logging.info("Preparing for LSUV-like initialization of specified trainable mismatched modules...")
-    # Ensure dataloaders are available
-    if 'train' not in dataloaders or not dataloaders['train']:
-        logging.error("Training dataloader not available for LSUV. Skipping LSUV.")
-    else:
-        try:
-            sample_batch_for_lsuv = next(iter(dataloaders['train']))
-            lsuv_initialize_modules(
-                model, 
-                list(final_mismatched_paths_for_lsuv),  # Use the filtered list
-                sample_batch_for_lsuv, 
-                args, # Pass the main args object
-                device, 
-                dtype, 
-                target_std=0.05,
-                target_mean=0.0,
-                iterations=10,
-                tolerance=0.01
-            )
-        except Exception as e_lsuv:
-            logging.error(f"Error during LSUV-like initialization: {e_lsuv}", exc_info=True)
-            logging.error("Continuing without LSUV adjustments due to error.")
-else:
-    logging.info("No trainable mismatched modules identified for LSUV-like init. Skipping LSUV.")
-# --- End of LSUV ---
+    return model, nodes_dist, optimizer, ema_updater, model_ema_obj
 
 
-# --- Setup Optimizer --- 
-optim = get_optim(args, model) # get_optim should filter for param.requires_grad == True
-logging.info(f"Optimizer created with LR: {args.lr}")
-# Count trainable parameters
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-logging.info(f"Total trainable parameters: {trainable_params}")
+# --- Training and Validation ---
+def _prepare_batch_for_model(data_batch: dict, args: argparse.Namespace, device: torch.device
+                             ) -> tuple[torch.Tensor, dict, torch.Tensor, torch.Tensor]:
+    '''
+    Prepares a raw data batch for model input by moving to device, normalizing,
+    and applying mean centering for coordinates.
+    '''
+    x_raw = data_batch['positions'].to(device, torch.float32)
+    node_mask_raw = data_batch['atom_mask'].to(device, torch.float32)
+    if node_mask_raw.ndim == 2:  # Ensure (B, N, 1)
+        node_mask_raw = node_mask_raw.unsqueeze(-1)
+    
+    edge_mask_batch = data_batch['edge_mask'].to(device, torch.float32)
+    one_hot_raw = data_batch['one_hot'].to(device, torch.float32)
+    charges_raw = data_batch['charges'].to(device, torch.float32)
 
-gradnorm_queue = utils.Queue()
-gradnorm_queue.add(100) # Initialize with a more conservative value
+    # Apply pre-calculated dataset-level normalization
+    # Move mean/std to device and unsqueeze for broadcasting: (1, 1, D_coord/D_feat)
+    dataset_x_mean_dev = args.dataset_x_mean.to(device).unsqueeze(0).unsqueeze(0)
+    dataset_x_std_dev = args.dataset_x_std.to(device).unsqueeze(0).unsqueeze(0)
+    dataset_h_cat_mean_dev = args.dataset_h_cat_mean.to(device).unsqueeze(0).unsqueeze(0)
+    dataset_h_cat_std_dev = args.dataset_h_cat_std.to(device).unsqueeze(0).unsqueeze(0)
 
-# --- Setup EMA --- 
-if args.ema_decay > 0:
-    ema = diffusion_utils.EMA(args.ema_decay)
-    model_ema = copy.deepcopy(model)
-    logging.info(f"EMA enabled with decay: {args.ema_decay}")
-else:
-    ema = None
-    model_ema = model
-    logging.info("EMA disabled.")
+    x_norm = (x_raw - dataset_x_mean_dev) / (dataset_x_std_dev + 1e-6)
+    one_hot_norm = (one_hot_raw - dataset_h_cat_mean_dev) / (dataset_h_cat_std_dev + 1e-6)
+    
+    # Mask features after normalization
+    x_norm = x_norm * node_mask_raw
+    one_hot_norm = one_hot_norm * node_mask_raw
+    charges_masked = charges_raw * node_mask_raw # Charges are typically not normalized with mean/std
 
-# --- Training Loop --- 
-best_val_loss = float('inf')
-logging.info("Starting Stage 1 Adaptation training...")
-for epoch in range(args.n_epochs):
+    # Center coordinates
+    x_model_input = diffusion_utils.remove_mean_with_mask(x_norm, node_mask_raw)
+    h_model_input = {'categorical': one_hot_norm, 'integer': charges_masked}
+    
+    return x_model_input, h_model_input, node_mask_raw, edge_mask_batch
+
+
+def _train_one_epoch(epoch_num: int, model: torch.nn.Module, dataloader: torch.utils.data.DataLoader,
+                     optimizer: torch.optim.Optimizer, ema_updater: diffusion_utils.EMA | None,
+                     model_ema: torch.nn.Module | None, args: argparse.Namespace, device: torch.device,
+                     nodes_dist: any, grad_norm_queue: project_utils.Queue
+                     ) -> tuple[float, float, float]:
+    '''Trains the model for one epoch.'''
     model.train()
-    model_dp.train()
-    start_time = time.time()
-    epoch_loss = 0.0
-    epoch_nll = 0.0
-    epoch_reg = 0.0
-    n_batches = 0
+    total_loss, total_nll, total_reg = 0.0, 0.0, 0.0
+    batches_processed = 0
 
-    pbar = tqdm(dataloaders['train'], desc=f"Epoch {epoch+1}/{args.n_epochs} (Stage 1)")
-    for i, data in enumerate(pbar):
-        # --- CRITICAL NaN CHECK FOR RAW INPUT (NEW) ---
-        if torch.isnan(data['positions']).any():
-            logging.error(f"CRITICAL NaN DETECTED IN RAW data['positions'] at Epoch {epoch+1}, Batch {i}. Skipping batch.")
-            # TODO: Consider saving problematic indices/data for offline analysis
-            # problematic_indices = data.get('idx', 'Unknown indices') 
-            # logging.error(f"Problematic indices (if available): {problematic_indices}")
-            # You might want to exit or implement more robust error handling/data skipping here.
-            continue # Skip this batch
-        # --- END OF CRITICAL NaN CHECK ---
+    pbar_desc = f"Epoch {epoch_num}/{args.n_epochs} (Stage 1 Train)"
+    pbar = tqdm(dataloader, desc=pbar_desc, unit="batch")
 
-        # --- Data Preparation --- 
-        x = data['positions'].to(device, dtype)
+    for i, data_batch in enumerate(pbar):
+        if torch.isnan(data_batch['positions']).any():
+            logging.error(f"NaN detected in raw input positions at Epoch {epoch_num}, Batch {i}. Skipping batch.")
+            continue
+
+        x_input, h_input, node_mask, edge_mask = _prepare_batch_for_model(data_batch, args, device)
         
-        # Check for NaNs in input positions (this check is now somewhat redundant due to the one above, but kept for safety)
-        if torch.isnan(x).any():
-            logging.error(f"ERROR: NaN detected in input x (positions) at Epoch {epoch+1}, Batch {i}. Skipping batch.")
-            # For more detailed debugging, you could print the problematic sample(s) or raise an error.
-            # Example: 
-            # for sample_idx in range(x.shape[0]):
-            #     if torch.isnan(x[sample_idx]).any():
-            #         print(f"  NaN found in sample {sample_idx} of batch {i}")
-            #         # import pdb; pdb.set_trace() # For interactive debugging
-            continue # Skip this batch if NaNs are found
-
-        # Get original atom_mask shape from dataloader
-        original_atom_mask_shape = data['atom_mask'].shape
-        node_mask = data['atom_mask'].to(device, dtype)
-        # Ensure node_mask becomes (B, N, 1)
-        if node_mask.ndim == 2: # (B, N)
-            node_mask = node_mask.unsqueeze(-1) # Becomes (B, N, 1)
-        elif node_mask.ndim == 3 and node_mask.shape[-1] == 1: # Already (B, N, 1)
-            pass # Correct shape
-        elif node_mask.ndim == 4 and node_mask.shape[-1] == 1 and node_mask.shape[-2] == 1: # (B, N, 1, 1)
-            node_mask = node_mask.squeeze(-1) # Becomes (B, N, 1)
-        else:
-            # If it's some other shape, this might be an issue from dataloader or preprocessing
-            logging.warning(f"WARNING: Unexpected original_atom_mask_shape: {original_atom_mask_shape}, current node_mask shape: {node_mask.shape}. Attempting to force to (B,N,1) if possible.")
-            # This part might need more robust handling depending on what shapes appear
-            if node_mask.ndim > 2 and node_mask.shape[-1] !=1 :
-                 node_mask = node_mask.unsqueeze(-1) # Try to add a final dim if not present
-            while node_mask.ndim > 3 or (node_mask.ndim == 3 and node_mask.shape[-1] != 1):
-                if node_mask.ndim > 2 and node_mask.shape[-1] == 1 and node_mask.shape[-2] == 1: # e.g. (B,N,1,1)
-                    node_mask = node_mask.squeeze(-1)
-                elif node_mask.ndim > 2 and node_mask.shape[-1] !=1: # e.g. (B,N,D) where D!=1
-                    logging.error("ERROR: Cannot easily convert node_mask to (B,N,1)") # Should not happen
-                    break 
-                else: # Fallback, just try to squeeze last if it's 1, or break
-                    if node_mask.shape[-1] == 1 and node_mask.ndim >3:
-                        node_mask = node_mask.squeeze(-1)
-                    else:
-                        break # Avoid infinite loop
-            if node_mask.ndim !=3 or node_mask.shape[-1] !=1:
-                 logging.warning(f"ALERT: Could not reliably shape node_mask to (B,N,1). Final shape: {node_mask.shape}")
-
-        edge_mask = data['edge_mask'].to(device, dtype)
-        one_hot = data['one_hot'].to(device, dtype)
-        charges = data['charges'].to(device, dtype)
-
-        # --- Apply Pre-calculated Dataset-level Normalization (NEW) ---
-        # Ensure stats are on the same device as the data
-        dataset_x_mean_dev = args.dataset_x_mean.to(device)
-        dataset_x_std_dev = args.dataset_x_std.to(device)
-        dataset_h_cat_mean_dev = args.dataset_h_cat_mean.to(device)
-        dataset_h_cat_std_dev = args.dataset_h_cat_std.to(device)
-
-        # Normalize positions: (x - mean) / std. Unsqueeze to allow broadcasting.
-        x_normalized = (x - dataset_x_mean_dev.unsqueeze(0).unsqueeze(0)) / dataset_x_std_dev.unsqueeze(0).unsqueeze(0)
-        
-        # Normalize one-hot features: (h_cat - mean) / std. Unsqueeze to allow broadcasting.
-        one_hot_normalized = (one_hot - dataset_h_cat_mean_dev.unsqueeze(0).unsqueeze(0)) / dataset_h_cat_std_dev.unsqueeze(0).unsqueeze(0)
-
-        # NEW: Ensure masked parts are zero after normalization
-        x_normalized = x_normalized * node_mask
-        one_hot_normalized = one_hot_normalized * node_mask
-        # Charges are not included/normalized based on args.include_charges = False
-        # --- End of New Normalization ---
-
-        # DEBUG: Print shapes just before the operation causing the error
-        logging.debug(f"Epoch {epoch+1}, Batch {i}: original_atom_mask_shape = {original_atom_mask_shape}, x.shape = {x.shape}, final node_mask.shape = {node_mask.shape}")
-        if x.shape[1] != node_mask.shape[1]:
-            logging.warning(f"ALERT: Mismatch in n_nodes between x ({x.shape[1]}) and node_mask ({node_mask.shape[1]}) in batch {i}!")
-
-        # The remove_mean_with_mask is usually applied by the model. 
-        # If we normalize x to have zero mean here, this call might become redundant or operate on already zero-mean data.
-        # Original model structure applies it to z (latent) or x input to diffusion.
-        # For now, we pass the normalized x and h to the loss function, which then feeds them to the model.
-        # The model's internal normalize() is now an identity op.
-        # The model's internal remove_mean_with_mask will still operate on its input (e.g. latents, or normalized x if VAE is bypassed).
-        
-        # Prepare x and h for the model/loss function
-        x_for_model = diffusion_utils.remove_mean_with_mask(x_normalized, node_mask) # Apply per-sample centering
-        
-        one_hot_for_model = one_hot_normalized * node_mask # Mask one-hot features
-        charges_for_model = charges * node_mask # Mask charges
-
-        h_for_model = {'categorical': one_hot_for_model, 'integer': charges_for_model}
-
-        # --- Context Preparation --- 
-        context = None # No context for unconditional adaptation
-
-        # --- Loss Calculation --- 
-        optim.zero_grad()
+        optimizer.zero_grad()
         try:
-            # Call loss function with context=None, using externally normalized x and h
-            nll, reg_term, mean_abs_z = qm9_losses.compute_loss_and_nll(args, model_dp, nodes_dist,
-                                                                      x_for_model, h_for_model, node_mask, edge_mask, context=None)
+            nll, reg_term, _ = qm9_losses.compute_loss_and_nll(
+                args, model, nodes_dist,
+                x_input, h_input, node_mask, edge_mask, context=None # Stage 1 is unconditional
+            )
             loss = nll + args.ode_regularization * reg_term
 
-            if torch.isnan(loss):
-                logging.warning(f"Warning: NaN loss encountered in batch {i}. Skipping.")
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.warning(f"NaN/Inf loss detected at training batch {i}, epoch {epoch_num}. Skipping batch update.")
                 continue
-
-            # --- Backpropagation & Optimization --- 
+            
             loss.backward()
-
+            
+            grad_norm = -1.0
             if args.clip_grad:
-                grad_norm = utils.gradient_clipping(model, gradnorm_queue)
-            else:
-                grad_norm = -1
+                grad_norm = project_utils.gradient_clipping(model, grad_norm_queue)
+            
+            optimizer.step()
 
-            optim.step()
+            if ema_updater is not None and model_ema is not None:
+                ema_updater.update_model_average(model_ema, model)
 
-            if ema is not None:
-                ema.update_model_average(model_ema, model)
+            total_loss += loss.item()
+            total_nll += nll.item()
+            total_reg += reg_term.item()
+            batches_processed += 1
 
-            # Logging
-            epoch_loss += loss.item()
-            epoch_nll += nll.item()
-            epoch_reg += reg_term.item()
-            n_batches += 1
-
-            if i % args.n_report_steps == 0:
-                pbar.set_postfix({'Loss': loss.item(), 'NLL': nll.item(), 'Reg': reg_term.item(), 'GradNorm': f"{grad_norm:.1f}"})
+            if i % args.n_report_steps == 0 or i == len(dataloader) - 1:
+                pbar.set_postfix({
+                    'Loss': loss.item(), 'NLL': nll.item(), 
+                    'Reg': reg_term.item(), 'GradNorm': f"{grad_norm:.2f}"
+                })
                 if not args.no_wandb:
-                    wandb.log({'batch_loss': loss.item(), 'batch_nll': nll.item(), 'batch_reg': reg_term.item(), 'grad_norm': grad_norm}, commit=False)
-
+                    wandb.log({
+                        'train_batch_loss_s1': loss.item(), 
+                        'train_batch_nll_s1': nll.item(),
+                        'train_batch_reg_s1': reg_term.item(), 
+                        'train_batch_grad_norm_s1': grad_norm
+                    }, commit=False) # Commit at epoch end
+        
         except Exception as e:
-            logging.error(f"Error during training batch {i}: {e}", exc_info=True)
-            continue # Corrected indentation: should be aligned with logging.error within the except block
+            logging.error(f"Error during training batch {i} in epoch {epoch_num}: {e}", exc_info=True)
+            continue # Continue to the next batch
 
-    # --- End of Epoch --- 
-    epoch_duration = time.time() - start_time
-    avg_epoch_loss = epoch_loss / n_batches if n_batches > 0 else 0.0
-    avg_epoch_nll = epoch_nll / n_batches if n_batches > 0 else 0.0
-    avg_epoch_reg = epoch_reg / n_batches if n_batches > 0 else 0.0
-    logging.info(f"Stage 1 Epoch {epoch+1} finished. Avg Loss: {avg_epoch_loss:.4f} (NLL: {avg_epoch_nll:.4f}, Reg: {avg_epoch_reg:.4f}), Duration: {epoch_duration:.2f}s")
-    log_dict = {'epoch_loss': avg_epoch_loss, 'epoch_nll': avg_epoch_nll, 'epoch_reg': avg_epoch_reg, 'epoch': epoch}
+    avg_loss = total_loss / batches_processed if batches_processed > 0 else 0.0
+    avg_nll = total_nll / batches_processed if batches_processed > 0 else 0.0
+    avg_reg = total_reg / batches_processed if batches_processed > 0 else 0.0
+    return avg_loss, avg_nll, avg_reg
 
-    # --- Validation --- 
-    # Optional: run validation even with small/no val set just to check for errors
-    if epoch % args.test_epochs == 0 and dataloaders['val'] and len(dataloaders['val'].dataset) > 0:
-        model.eval()
-        model_eval = model_ema if ema is not None else model
-        model_eval_dp = model_eval
 
-        val_nll = 0.0
-        n_val_samples = 0
-        with torch.no_grad():
-            pbar_val = tqdm(dataloaders['val'], desc=f"Validation Epoch {epoch+1} (Stage 1)")
-            for data in pbar_val:
-                # --- Validation Data Prep --- 
-                x_raw_val = data['positions'].to(device, dtype)
-                one_hot_raw_val = data['one_hot'].to(device, dtype)
-                charges_val_raw = data['charges'].to(device, dtype) # Use a distinct name for raw charges
+@torch.no_grad()
+def _validate_one_epoch(model_to_eval: torch.nn.Module, dataloader: torch.utils.data.DataLoader,
+                        args: argparse.Namespace, device: torch.device, nodes_dist: any
+                        ) -> float:
+    '''Validates the model for one epoch, returning average NLL.'''
+    model_to_eval.eval()
+    total_val_nll = 0.0
+    samples_processed = 0
+
+    pbar_val = tqdm(dataloader, desc="Validation (Stage 1)", unit="batch")
+    for data_batch in pbar_val:
+        if torch.isnan(data_batch['positions']).any():
+            logging.warning("NaN detected in raw validation input positions. Skipping batch.")
+            continue
+
+        x_input, h_input, node_mask, edge_mask = _prepare_batch_for_model(data_batch, args, device)
+        
+        try:
+            nll, _, _ = qm9_losses.compute_loss_and_nll(
+                args, model_to_eval, nodes_dist,
+                x_input, h_input, node_mask, edge_mask, context=None
+            )
+            if not (torch.isnan(nll) or torch.isinf(nll)):
+                total_val_nll += nll.item() * x_input.size(0) # NLL is per sample, sum then average
+                samples_processed += x_input.size(0)
+            else:
+                logging.warning("NaN/Inf NLL during validation batch.")
+        except Exception as e:
+            logging.error(f"Error during validation batch: {e}", exc_info=True)
+            continue
                 
-                batch_size = x_raw_val.size(0)
-                # Use distinct variable name for validation node_mask to avoid confusion with training loop
-                node_mask_val = data['atom_mask'].to(device, dtype)
-                if node_mask_val.ndim == 2: # Ensure (B,N)
-                     node_mask_val = node_mask_val # Keep as (B,N) for unsqueeze later if needed by specific functions
-                # Reshape to (B, N, 1) for broadcasting and functions expecting it like remove_mean_with_mask
-                node_mask_for_ops_val = node_mask_val.unsqueeze(-1) if node_mask_val.ndim == 2 else node_mask_val 
-                if node_mask_for_ops_val.ndim != 3 or node_mask_for_ops_val.shape[-1] !=1:
-                    # Attempt to fix or log error if shape is still not (B,N,1)
-                    logging.warning(f"Valid. node_mask_for_ops_val unexpected shape: {node_mask_for_ops_val.shape}. Re-checking original atom_mask shape: {data['atom_mask'].shape}")
-                    # Add robust reshaping if necessary, similar to training loop if problems persist
-                    # For now, assume it will be (B,N,1) after unsqueeze if original is (B,N)
-                
-                edge_mask_val = data['edge_mask'].to(device, dtype)
+    avg_val_nll = total_val_nll / samples_processed if samples_processed > 0 else float('inf')
+    return avg_val_nll
 
-                # Apply dataset-level normalization to validation data too
-                dataset_x_mean_dev = args.dataset_x_mean.to(device)
-                dataset_x_std_dev = args.dataset_x_std.to(device)
-                dataset_h_cat_mean_dev = args.dataset_h_cat_mean.to(device)
-                dataset_h_cat_std_dev = args.dataset_h_cat_std.to(device)
 
-                x_val_normalized = (x_raw_val - dataset_x_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_x_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
-                one_hot_val_normalized = (one_hot_raw_val - dataset_h_cat_mean_dev.unsqueeze(0).unsqueeze(0)) / (dataset_h_cat_std_dev.unsqueeze(0).unsqueeze(0) + 1e-6)
-                
-                # --- Explicitly mask x_val_normalized BEFORE remove_mean_with_mask (NEW) ---
-                x_val_normalized = x_val_normalized * node_mask_for_ops_val
-                # --- End of NEW ---
+def _save_checkpoint(model_to_save: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                     args_config: argparse.Namespace, epoch_idx: int, is_best: bool = False, is_final: bool = False):
+    '''Saves a model checkpoint, optimizer state, and arguments.'''
+    if not args_config.save_model:
+        return
 
-                # The problematic line `x_val_normalized = x_val_normalized * node_mask` should be removed.
-                # Correct processing for x and h for the model:
-                x_val_for_model = diffusion_utils.remove_mean_with_mask(x_val_normalized, node_mask_for_ops_val) 
+    suffix = "best" if is_best else ("final" if is_final else f"epoch_{epoch_idx+1}")
+    
+    # Save model weights
+    project_utils.save_model(model_to_save, join(args_config.checkpoints_dir, f'stage1_adapted_model_{suffix}.npy'))
+    
+    # For best and final checkpoints, also save optimizer and args
+    if is_best or is_final:
+        project_utils.save_model(optimizer, join(args_config.checkpoints_dir, f'stage1_optim_{suffix}.npy'))
+        
+        # Save args, adding current epoch
+        args_to_save = copy.deepcopy(args_config)
+        args_to_save.completed_epoch_s1 = epoch_idx + 1 # 1-indexed completed epoch
+        args_path = join(args_config.checkpoints_dir, f'stage1_args_{suffix}.pickle')
+        with open(args_path, 'wb') as f:
+            pickle.dump(args_to_save, f)
+        logging.info(f"Args for Stage 1 checkpoint '{suffix}' saved to {args_path}")
 
-                one_hot_val_for_model = one_hot_val_normalized * node_mask_for_ops_val 
-                charges_val_for_model = charges_val_raw * node_mask_for_ops_val # Mask raw charges
-                
-                h_val_for_model = {'categorical': one_hot_val_for_model, 'integer': charges_val_for_model}
-                
-                # --- Validation Context --- 
-                context = None # No context for unconditional validation
-                
-                # --- Validation Loss Calculation --- 
-                try:
-                     # Call loss function with context=None
-                    nll, _, _ = qm9_losses.compute_loss_and_nll(args, model_eval_dp, nodes_dist, 
-                                                                 x_val_for_model, h_val_for_model,
-                                                                 node_mask_for_ops_val, # Use the correctly shaped mask
-                                                                 edge_mask_val, context=None)
-                    if not torch.isnan(nll):
-                        val_nll += nll.item() * batch_size
-                        n_val_samples += batch_size
-                    else:
-                        logging.warning("Warning: NaN NLL encountered during validation.")
-                except Exception as e:
-                    logging.error(f"Error during validation batch: {e}", exc_info=True)
-                    # Continue validation
+    logging.info(f"Stage 1 Checkpoint '{suffix}' (Epoch {epoch_idx+1}) saved to {args_config.checkpoints_dir}")
 
-        avg_val_nll = val_nll / n_val_samples if n_val_samples > 0 else float('inf')
-        logging.info(f"Stage 1 Validation Epoch {epoch+1} Avg NLL: {avg_val_nll:.4f}")
-        log_dict['val_nll'] = avg_val_nll
 
-        # --- Save Checkpoint based on Validation NLL --- 
-        if avg_val_nll < best_val_loss: # Still useful to save best model based on NLL on unlabeled data
-            best_val_loss = avg_val_nll
-            logging.info(f"New best validation NLL: {best_val_loss:.4f}. Saving checkpoint...")
-            if args.save_model:
-                chkpt_dir = join(args.output_dir, 'checkpoints')
-                os.makedirs(chkpt_dir, exist_ok=True)
-                # Save adapted model checkpoints (use specific names)
-                utils.save_model(model, join(chkpt_dir, 'stage1_adapted_last.npy')) 
-                model_ema_save = model_ema if ema is not None else model
-                utils.save_model(model_ema_save, join(chkpt_dir, 'stage1_adapted_ema_best.npy'))
-                utils.save_model(optim, join(chkpt_dir, 'stage1_optim_best.npy'))
-                args.current_epoch = epoch + 1
-                with open(join(chkpt_dir, 'stage1_args_best.pickle'), 'wb') as f:
-                    pickle.dump(args, f)
-                logging.info(f"Stage 1 Checkpoint saved to {chkpt_dir}")
-    else:
-         # If not validating, still save periodically or at the end?
-         # For now, only saving on validation improvement.
-         pass
+def run_training_loop(args: argparse.Namespace, model: torch.nn.Module, model_ema: torch.nn.Module | None,
+                      dataloaders: dict, nodes_dist: any, optimizer: torch.optim.Optimizer,
+                      ema_updater: diffusion_utils.EMA | None, device: torch.device):
+    '''Main training and validation loop for Stage 1 adaptation.'''
+    best_val_nll = float('inf')
+    grad_norm_queue = project_utils.Queue() # For gradient norm logging
+    grad_norm_queue.add(100.0) # Initialize with a relatively high value
 
-    # Log epoch metrics to wandb
+    logging.info("Starting Stage 1 Adaptation training loop...")
+    for epoch in range(args.n_epochs):
+        epoch_start_time = time.time()
+        
+        avg_loss, avg_nll, avg_reg = _train_one_epoch(
+            epoch + 1, model, dataloaders['train'], optimizer, ema_updater, model_ema,
+            args, device, nodes_dist, grad_norm_queue
+        )
+        epoch_duration = time.time() - epoch_start_time
+        
+        logging.info(
+            f"Stage 1 Epoch {epoch+1}/{args.n_epochs} Summary: "
+            f"Avg Loss: {avg_loss:.4f} (NLL: {avg_nll:.4f}, Reg: {avg_reg:.4f}), "
+            f"Duration: {epoch_duration:.2f}s"
+        )
+        
+        wandb_log_data = {
+            'epoch_s1': epoch + 1,
+            'train_epoch_loss_s1': avg_loss,
+            'train_epoch_nll_s1': avg_nll,
+            'train_epoch_reg_s1': avg_reg,
+            'epoch_duration_s1_sec': epoch_duration
+        }
+
+        # Validation
+        perform_validation = (epoch + 1) % args.test_epochs == 0
+        val_dl = dataloaders.get('val')
+        
+        if perform_validation and val_dl and len(val_dl.dataset) > 0:
+            model_for_eval = model_ema if ema_updater is not None else model
+            avg_val_nll = _validate_one_epoch(model_for_eval, val_dl, args, device, nodes_dist)
+            logging.info(f"  Validation NLL (Epoch {epoch+1}): {avg_val_nll:.4f}")
+            wandb_log_data['val_epoch_nll_s1'] = avg_val_nll
+
+            if avg_val_nll < best_val_nll:
+                best_val_nll = avg_val_nll
+                logging.info(f"    New best validation NLL for Stage 1: {best_val_nll:.4f}. Saving checkpoint.")
+                _save_checkpoint(model_for_eval, optimizer, args, epoch, is_best=True)
+        elif perform_validation:
+            logging.info(f"Skipping validation for epoch {epoch+1}: No validation data or dataloader is empty.")
+        
+        # Save last model checkpoint periodically (optional, can be frequent)
+        # if (epoch + 1) % args.save_every_n_epochs == 0: # Example: save every 10 epochs
+        # _save_checkpoint(model_ema if ema_updater else model, optimizer, args, epoch, is_best=False)
+
+        if not args.no_wandb:
+            wandb.log(wandb_log_data, commit=True) # Commit all epoch metrics at once
+            
+    logging.info("Stage 1 Adaptation training finished.")
+    # Save the final model
+    final_model_to_save = model_ema if ema_updater is not None else model
+    _save_checkpoint(final_model_to_save, optimizer, args, args.n_epochs - 1, is_final=True)
+
+
+# --- Main Execution ---
+def main():
+    '''Main execution function for Stage 1 adaptation.'''
+    # --- Setup ---
+    args, device = _parse_and_prepare_args()
+    _setup_logging(args.log_file)
+    _setup_environment(args, device) # Seed, directories
+    _setup_wandb(args) # Must be after logging and args are finalized
+
+    # --- Data Loading and Preparation ---
+    dataloaders, dataset_info = _load_and_prepare_data(args, device)
+    
+    # --- Model, Optimizer, EMA Initialization ---
+    model, nodes_dist, optimizer, ema_updater, model_ema = \
+        _build_model_and_optimizer_ema(args, device, dataset_info, dataloaders)
+    
+    # --- Training ---
+    run_training_loop(args, model, model_ema, dataloaders, nodes_dist,
+                      optimizer, ema_updater, device)
+
+    # --- Finalization ---
     if not args.no_wandb:
-        wandb.log(log_dict, commit=True)
+        wandb.finish()
+    logging.info("Script execution completed successfully.")
 
 
-logging.info("Stage 1 Adaptation finished.")
-# Save final model state if needed
-if args.save_model:
-    chkpt_dir = join(args.output_dir, 'checkpoints')
-    os.makedirs(chkpt_dir, exist_ok=True)
-    final_model_name = 'stage1_adapted_ema_final.npy' if ema is not None else 'stage1_adapted_final.npy'
-    final_model_to_save = model_ema if ema is not None else model
-    utils.save_model(final_model_to_save, join(chkpt_dir, final_model_name))
-    utils.save_model(optim, join(chkpt_dir, 'stage1_optim_final.npy'))
-    args.current_epoch = args.n_epochs
-    with open(join(chkpt_dir, 'stage1_args_final.pickle'), 'wb') as f:
-        pickle.dump(args, f)
-    logging.info(f"Final Stage 1 model state saved to {chkpt_dir}")
-
-
-if not args.no_wandb:
-    wandb.finish() 
+if __name__ == "__main__":
+    main() 
